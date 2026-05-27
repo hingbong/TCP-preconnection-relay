@@ -61,6 +61,20 @@ binary_works() {
     grep -q "ERROR: LOCAL_IP not set" <<< "$out"
 }
 
+is_repo_source_dir() {
+    local dir="$1"
+
+    [ -f "$dir/tcp_pool.c" ] || return 1
+    [ -f "$dir/install.sh" ] || return 1
+
+    if [ -d "$dir/.git" ]; then
+        return 0
+    fi
+
+    [ -f "$dir/build-release.sh" ] && [ -d "$dir/dist" ] && return 0
+    [ -f "$dir/README.md" ] && grep -q "TCP-preconnection-relay" "$dir/README.md" 2>/dev/null
+}
+
 clone_repo() {
     ensure_packages git ca-certificates
 
@@ -118,7 +132,13 @@ install_from_source_dir() {
         echo "缺少源码文件：$src_dir/tcp_pool.c" >&2
         exit 1
     fi
-    cp "$src_dir/tcp_pool.c" /root/tcp_pool.c
+
+    local src_file dst_file
+    src_file="$(readlink -f "$src_dir/tcp_pool.c")"
+    dst_file="$(readlink -m /root/tcp_pool.c)"
+    if [ "$src_file" != "$dst_file" ]; then
+        cp "$src_file" "$dst_file"
+    fi
 
     if gcc -O2 -pthread -march=native -o /root/tcp_pool /root/tcp_pool.c; then
         echo "Compile Succeeded"
@@ -132,7 +152,7 @@ install_program() {
     local src_dir=""
     local cloned_dir=""
 
-    if [ -f "$SCRIPT_DIR/tcp_pool.c" ] && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
+    if is_repo_source_dir "$SCRIPT_DIR" && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
         src_dir="$SCRIPT_DIR"
     else
         cloned_dir="$(clone_repo)"
@@ -146,7 +166,7 @@ install_program() {
     fi
 }
 
-if [ -f "$SCRIPT_DIR/tcp_pool.c" ] && [ "${TCP_POOL_PREBUILT:-0}" != "1" ] && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
+if is_repo_source_dir "$SCRIPT_DIR" && [ "${TCP_POOL_PREBUILT:-0}" != "1" ] && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
     install_from_source_dir "$SCRIPT_DIR"
 else
     install_program
@@ -155,28 +175,6 @@ fi
 ensure_packages nano
 
 mkdir -p /etc/tcp_pool
-
-cleanup_old_tcp_pool() {
-    echo "正在清空旧版配置和服务..."
-
-    mapfile -t units < <(
-        {
-            systemctl list-units --full --all --no-legend 'tcp-pool@*.service' 2>/dev/null | awk '{print $1}'
-            systemctl list-unit-files --full --no-legend 'tcp-pool@*.service' 2>/dev/null | awk '{print $1}'
-        } | sort -u
-    )
-
-    for unit in "${units[@]}"; do
-        [ -n "$unit" ] || continue
-        systemctl stop "$unit" 2>/dev/null || true
-        systemctl disable "$unit" 2>/dev/null || true
-    done
-
-    rm -f /etc/tcp_pool/*.conf
-    rm -f /etc/systemd/system/tcp-pool@.service
-
-    systemctl daemon-reload || true
-}
 
 apply_tcp_tuning_generic() {
     echo "正在写入 TCP 调优（通用版）配置..."
@@ -228,63 +226,6 @@ EOF
         echo "你可以手动检查 sysctl 输出，或稍后执行：sysctl --system"
     fi
 }
-
-if [ -n "${TCP_POOL_CLEAR_OLD:-}" ]; then
-    CLEAR_OLD="$TCP_POOL_CLEAR_OLD"
-else
-    read -r -p "你是否要清空旧版配置？如果是v1.3之前版本的必须清空，因为配置大改了。 [y/N]: " CLEAR_OLD
-fi
-case "$CLEAR_OLD" in
-    y|Y)
-        cleanup_old_tcp_pool
-        ;;
-    *)
-        true
-        ;;
-esac
-
-if [ ! -f /etc/tcp_pool/relays.conf ]; then
-cat > /etc/tcp_pool/relays.conf <<'EOF'
-#注意注释不能打在行尾，会解析失败，亲身踩坑
-#[US] 转发标识，中括号内填写标签，比如US,HK1,HK2
-#LOCAL_IP= 本地ip，如果监听v4网卡就填写0.0.0.0。如果是v6则为俩英文冒号::。只监听本机某个特定网卡ip就填那个ip就行，比如127.0.0.0，38.175.100.122。注意俩::可能会同时监听这个端口的v4。
-#LOCAL_PORT= 本地端口，记得ufw或者服务商的防火墙打开
-#REMOTE_IP= 远端ip，你转发的目标服务器，现在支持v6和域名
-#REMOTE_TCP_PORT= 远端的接收TCP的端口
-#REMOTE_UDP_PORT= 远端的接收UDP的端口（如果你的服务端UDP和TCP跑在一个端口的，填写一样就行）
-#可选高级参数，不写就用默认值：POOL_SIZE=24 REFILL_BATCH=8 SPLICE_CHUNK=262144
-#POOL_SIZE= 预连接池大小，0表示关闭预连接；高并发可以提高到48/96，别超过远端承受能力
-#REFILL_BATCH= 每轮补连接的最大并发数
-#CONNECT_TIMEOUT= 出站TCP连接超时秒数
-#IDLE_TIMEOUT= 已使用TCP连接空闲回收秒数
-#HALF_CLOSE_TIMEOUT= 半关闭状态保留秒数
-#PRECONNECT_TTL_MS= 池内未使用预连接轮换毫秒数
-#SPLICE_CHUNK= 单方向splice缓冲目标，建议262144到1048576
-#UDP_IDLE_TIMEOUT= UDP会话空闲回收秒数
-#UDP_SOCKET_BUFFER= UDP socket缓冲目标字节数
-#LISTEN_BACKLOG= TCP listen backlog
-#LOG_ENABLE= 0关闭日志，1开启日志
-#LOG_RATE_PER_SEC= 每秒最多刷出的日志条数
-#TCP_USER_TIMEOUT_MS= TCP未确认数据最长等待毫秒数，0表示不用该选项
-
-#样例，看懂了删掉就行(ctrl k 快速一行行清除，小小白白可能不知道)。现在支持单文件多配置，格式就是标签加上后面一坨东西。
-[JP]
-LOCAL_IP=0.0.0.0
-LOCAL_PORT=11451
-REMOTE_IP=38.125.91.68
-REMOTE_TCP_PORT=8888
-REMOTE_UDP_PORT=9999
-POOL_SIZE=24
-REFILL_BATCH=8
-
-[HK]
-LOCAL_IP=::
-LOCAL_PORT=11451
-REMOTE_IP=域名.com
-REMOTE_TCP_PORT=8888
-REMOTE_UDP_PORT=9999
-EOF
-fi
 
 cat > /usr/local/bin/tcp-pool-parse <<'EOF'
 #!/bin/bash
@@ -608,13 +549,77 @@ valid_int_range() {
     [[ "$val" =~ ^[0-9]+$ ]] && (( val >= min && val <= max ))
 }
 
+ADVANCED_KEYS=(
+    POOL_SIZE
+    REFILL_BATCH
+    CONNECT_TIMEOUT
+    IDLE_TIMEOUT
+    HALF_CLOSE_TIMEOUT
+    PRECONNECT_TTL_MS
+    SPLICE_CHUNK
+    UDP_IDLE_TIMEOUT
+    UDP_SOCKET_BUFFER
+    LISTEN_BACKLOG
+    LOG_ENABLE
+    LOG_RATE_PER_SEC
+    TCP_USER_TIMEOUT_MS
+)
+
+ADVANCED_DEFAULTS=(
+    24
+    8
+    5
+    240
+    10
+    50000
+    262144
+    60
+    4194304
+    16384
+    1
+    24
+    0
+)
+
+ADVANCED_RANGES=(
+    "0 256"
+    "1 256"
+    "1 120"
+    "30 86400"
+    "1 300"
+    "10000 3600000"
+    "16384 1048576"
+    "5 3600"
+    "65536 67108864"
+    "128 65535"
+    "0 1"
+    "0 10000"
+    "0 3600000"
+)
+
+ADVANCED_LABELS=(
+    "预连接池大小，0表示关闭预连接"
+    "每轮补连接最大并发数"
+    "出站 TCP 连接超时秒数"
+    "已使用 TCP 连接空闲回收秒数"
+    "半关闭状态保留秒数"
+    "池内未使用预连接轮换毫秒数"
+    "单方向 splice 缓冲目标字节数"
+    "UDP 会话空闲回收秒数"
+    "UDP socket 缓冲目标字节数"
+    "TCP listen backlog"
+    "日志开关，0关闭，1开启"
+    "每秒最多刷出的日志条数"
+    "TCP 未确认数据最长等待毫秒数，0表示不用"
+)
+
 ensure_conf() {
     mkdir -p "$CONF_DIR"
     [ -f "$CONF" ] || touch "$CONF"
 }
 
 list_tags() {
-    ensure_conf
+    [ -f "$CONF" ] || return 0
     awk '
         /^[[:space:]]*\[[A-Za-z0-9_-]+\][[:space:]]*$/ {
             line=$0
@@ -647,8 +652,47 @@ remove_section_file() {
     rm -f "$tmp"
 }
 
+get_section_value() {
+    local tag="$1"
+    local key="$2"
+    awk -v target="$tag" -v wanted="$key" '
+        /^[[:space:]]*\[[A-Za-z0-9_-]+\][[:space:]]*$/ {
+            line=$0
+            sub(/^[[:space:]]*\[/, "", line)
+            sub(/\][[:space:]]*$/, "", line)
+            in_sec=(line == target)
+        }
+        in_sec && $0 ~ ("^" wanted "=") {
+            sub("^[^=]*=", "")
+            print
+            exit
+        }
+    ' "$CONF"
+}
+
+append_section() {
+    local tag="$1"
+    shift
+
+    {
+        echo ""
+        echo "[$tag]"
+        local kv
+        for kv in "$@"; do
+            echo "$kv"
+        done
+    } >> "$CONF"
+}
+
+replace_section() {
+    local tag="$1"
+    shift
+
+    remove_section_file "$tag"
+    append_section "$tag" "$@"
+}
+
 show_instances() {
-    ensure_conf
     echo ""
     echo "当前转发："
 
@@ -713,15 +757,113 @@ prompt_default() {
     local prompt="$1"
     local def="$2"
     local val
-    read -r -p "$prompt [$def]: " val
+    read -r -p "$prompt [$def]: " val >&2
     printf '%s' "${val:-$def}"
+}
+
+prompt_int_range() {
+    local prompt="$1"
+    local def="$2"
+    local min="$3"
+    local max="$4"
+    local val
+
+    while true; do
+        val="$(prompt_default "$prompt" "$def")"
+        if valid_int_range "$val" "$min" "$max"; then
+            printf '%s' "$val"
+            return 0
+        fi
+        echo "请输入 $min-$max 范围内的整数。" >&2
+    done
+}
+
+collect_advanced_params() {
+    local tag="${1:-}"
+    local mode="${2:-create}"
+    local configure="n"
+
+    if [ "$mode" = "edit" ]; then
+        read -r -p "是否修改高级参数？不修改会保留原值。[y/N]: " configure
+        case "$configure" in
+            y|Y) ;;
+            *)
+                local key val
+                for key in "${ADVANCED_KEYS[@]}"; do
+                    val="$(get_section_value "$tag" "$key")"
+                    [ -n "$val" ] && printf '%s=%s\n' "$key" "$val"
+                done
+                return 0
+                ;;
+        esac
+    else
+        read -r -p "是否配置高级参数？不配置则全部使用程序默认值。[y/N]: " configure
+        case "$configure" in
+            y|Y) ;;
+            *) return 0 ;;
+        esac
+    fi
+
+    echo "高级参数配置：直接回车使用括号内默认/原值。" >&2
+    local i key def cur prompt min max val
+    for i in "${!ADVANCED_KEYS[@]}"; do
+        key="${ADVANCED_KEYS[$i]}"
+        def="${ADVANCED_DEFAULTS[$i]}"
+        cur=""
+        [ -n "$tag" ] && cur="$(get_section_value "$tag" "$key")"
+        [ -n "$cur" ] && def="$cur"
+        read -r min max <<< "${ADVANCED_RANGES[$i]}"
+        prompt="${ADVANCED_LABELS[$i]} $key"
+        val="$(prompt_int_range "$prompt" "$def" "$min" "$max")"
+        printf '%s=%s\n' "$key" "$val"
+    done
+}
+
+collect_relay_params() {
+    local tag="${1:-}"
+    local mode="${2:-create}"
+    local local_ip local_port remote_ip remote_tcp remote_udp
+
+    local_ip="$(prompt_default "本地监听 IP" "$(get_section_value "$tag" LOCAL_IP)")"
+    [ -n "$local_ip" ] || local_ip="0.0.0.0"
+
+    while true; do
+        local_port="$(prompt_default "本地监听端口" "$(get_section_value "$tag" LOCAL_PORT)")"
+        valid_port "$local_port" && break
+        echo "端口必须是 1-65535。" >&2
+    done
+
+    while true; do
+        remote_ip="$(prompt_default "远端 IP 或域名" "$(get_section_value "$tag" REMOTE_IP)")"
+        [ -n "$remote_ip" ] && break
+        echo "远端 IP 或域名不能为空。" >&2
+    done
+
+    while true; do
+        remote_tcp="$(prompt_default "远端 TCP 端口" "$(get_section_value "$tag" REMOTE_TCP_PORT)")"
+        valid_port "$remote_tcp" && break
+        echo "端口必须是 1-65535。" >&2
+    done
+
+    remote_udp="$(prompt_default "远端 UDP 端口" "$(get_section_value "$tag" REMOTE_UDP_PORT)")"
+    [ -n "$remote_udp" ] || remote_udp="$remote_tcp"
+    while ! valid_port "$remote_udp"; do
+        read -r -p "远端 UDP 端口: " remote_udp
+    done
+
+    printf 'LOCAL_IP=%s\n' "$local_ip"
+    printf 'LOCAL_PORT=%s\n' "$local_port"
+    printf 'REMOTE_IP=%s\n' "$remote_ip"
+    printf 'REMOTE_TCP_PORT=%s\n' "$remote_tcp"
+    printf 'REMOTE_UDP_PORT=%s\n' "$remote_udp"
+    collect_advanced_params "$tag" "$mode"
 }
 
 create_relay() {
     need_root
     ensure_conf
 
-    local tag local_ip local_port remote_ip remote_tcp remote_udp pool refill
+    local tag
 
     while true; do
         read -r -p "转发标签（字母/数字/_/-，如 HK）: " tag
@@ -736,56 +878,40 @@ create_relay() {
         break
     done
 
-    local_ip="$(prompt_default "本地监听 IP" "0.0.0.0")"
-
-    while true; do
-        read -r -p "本地监听端口: " local_port
-        valid_port "$local_port" && break
-        echo "端口必须是 1-65535。"
-    done
-
-    while true; do
-        read -r -p "远端 IP 或域名: " remote_ip
-        [ -n "$remote_ip" ] && break
-    done
-
-    while true; do
-        read -r -p "远端 TCP 端口: " remote_tcp
-        valid_port "$remote_tcp" && break
-        echo "端口必须是 1-65535。"
-    done
-
-    remote_udp="$(prompt_default "远端 UDP 端口" "$remote_tcp")"
-    while ! valid_port "$remote_udp"; do
-        read -r -p "远端 UDP 端口: " remote_udp
-    done
-
-    pool="$(prompt_default "预连接池大小" "24")"
-    while ! valid_int_range "$pool" 0 256; do
-        read -r -p "预连接池大小（0-256）: " pool
-    done
-
-    refill="$(prompt_default "每轮补连接并发" "8")"
-    while ! valid_int_range "$refill" 1 256; do
-        read -r -p "每轮补连接并发（1-256）: " refill
-    done
-
-    {
-        echo ""
-        echo "[$tag]"
-        echo "LOCAL_IP=$local_ip"
-        echo "LOCAL_PORT=$local_port"
-        echo "REMOTE_IP=$remote_ip"
-        echo "REMOTE_TCP_PORT=$remote_tcp"
-        echo "REMOTE_UDP_PORT=$remote_udp"
-        echo "POOL_SIZE=$pool"
-        echo "REFILL_BATCH=$refill"
-    } >> "$CONF"
+    mapfile -t relay_lines < <(collect_relay_params "$tag" create)
+    append_section "$tag" "${relay_lines[@]}"
 
     tcp-pool-parse
     systemctl enable "tcp-pool@$tag"
     systemctl restart "tcp-pool@$tag"
     echo "已创建并启动：tcp-pool@$tag"
+}
+
+modify_relay() {
+    need_root
+    ensure_conf
+    show_instances
+
+    local tag
+    read -r -p "要修改的标签: " tag
+    if ! tag_exists "$tag"; then
+        echo "标签不存在：$tag"
+        return 1
+    fi
+
+    mapfile -t relay_lines < <(collect_relay_params "$tag" edit)
+    replace_section "$tag" "${relay_lines[@]}"
+
+    tcp-pool-parse
+    read -r -p "是否立即重启该转发？[Y/n]: " yn
+    case "$yn" in
+        n|N) ;;
+        *)
+            systemctl enable "tcp-pool@$tag"
+            systemctl restart "tcp-pool@$tag"
+            ;;
+    esac
+    echo "已修改：$tag"
 }
 
 delete_relay() {
@@ -920,13 +1046,20 @@ update_program() {
     need_root
     command -v curl >/dev/null 2>&1 || { echo "缺少 curl，请先安装。"; return 1; }
 
+    echo "更新会同步更新主程序、systemd 模板、tcp-pool-* 辅助脚本和 relay 管理脚本。"
+    echo "已有 /etc/tcp_pool/relays.conf 不会被安装脚本修改。"
+    read -r -p "确认更新？[Y/n]: " yn
+    case "$yn" in
+        n|N) echo "已取消。"; return 0 ;;
+    esac
+
     local tmp
     tmp="$(mktemp)"
     curl -fsSL "$INSTALL_URL" -o "$tmp"
-    TCP_POOL_SKIP_PROMPTS=1 TCP_POOL_CLEAR_OLD=n bash "$tmp"
+    TCP_POOL_SKIP_PROMPTS=1 bash "$tmp"
     rm -f "$tmp"
     tcp-pool-start || true
-    echo "更新完成。"
+    echo "更新完成，relay 管理脚本已同步更新。"
 }
 
 uninstall_program() {
@@ -974,31 +1107,33 @@ menu() {
         echo "========================================"
         show_instances
         echo "1) 创建转发"
-        echo "2) 删除转发"
-        echo "3) 启动/重启某个转发"
-        echo "4) 停止某个转发"
-        echo "5) 重启并应用全部转发"
-        echo "6) 停止全部转发"
-        echo "7) 查看日志"
-        echo "8) 编辑配置文件"
-        echo "9) 应用 TCP 调优"
-        echo "10) 更新程序"
-        echo "11) 卸载程序"
+        echo "2) 修改转发"
+        echo "3) 删除转发"
+        echo "4) 启动/重启某个转发"
+        echo "5) 停止某个转发"
+        echo "6) 重启并应用全部转发"
+        echo "7) 停止全部转发"
+        echo "8) 查看日志"
+        echo "9) 编辑配置文件"
+        echo "10) 应用 TCP 调优"
+        echo "11) 更新程序和 relay 管理脚本"
+        echo "12) 卸载程序"
         echo "0) 退出"
         echo ""
         read -r -p "请选择: " choice
         case "$choice" in
             1) create_relay; pause ;;
-            2) delete_relay; pause ;;
-            3) start_one; pause ;;
-            4) stop_one; pause ;;
-            5) restart_all; pause ;;
-            6) stop_all; pause ;;
-            7) logs_one ;;
-            8) edit_conf; pause ;;
-            9) apply_tuning; pause ;;
-            10) update_program; pause ;;
-            11) uninstall_program; exit 0 ;;
+            2) modify_relay; pause ;;
+            3) delete_relay; pause ;;
+            4) start_one; pause ;;
+            5) stop_one; pause ;;
+            6) restart_all; pause ;;
+            7) stop_all; pause ;;
+            8) logs_one ;;
+            9) edit_conf; pause ;;
+            10) apply_tuning; pause ;;
+            11) update_program; pause ;;
+            12) uninstall_program; exit 0 ;;
             0) exit 0 ;;
             *) echo "无效选择"; pause ;;
         esac
@@ -1009,6 +1144,7 @@ need_root
 
 case "${1:-}" in
     add|create) create_relay ;;
+    modify|mod|set) modify_relay ;;
     del|delete|remove) delete_relay ;;
     list|status) show_instances ;;
     start) start_one ;;
@@ -1023,7 +1159,7 @@ case "${1:-}" in
     uninstall) uninstall_program ;;
     ""|menu) menu ;;
     *)
-        echo "用法：relay [add|delete|list|start|stop|stop-all|restart|logs|edit|tune|update|uninstall]"
+        echo "用法：relay [add|modify|delete|list|start|stop|stop-all|restart|logs|edit|tune|update|uninstall]"
         exit 1
         ;;
 esac
@@ -1037,13 +1173,13 @@ echo " Install completed!"
 echo "========================================"
 
 if [ "${TCP_POOL_SKIP_PROMPTS:-0}" != "1" ]; then
-    read -r -p "是否现在打开管理脚本 relay？[Y/n]: " OPEN_RELAY_NOW
+    read -r -p "是否现在打开管理脚本 relay？[y/N]: " OPEN_RELAY_NOW
     case "$OPEN_RELAY_NOW" in
-        n|N)
-            echo "之后可以输入 relay 打开管理脚本。"
+        y|Y)
+            relay
             ;;
         *)
-            relay
+            echo "之后可以输入 relay 打开管理脚本。"
             ;;
     esac
 

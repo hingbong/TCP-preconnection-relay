@@ -40,12 +40,13 @@ TCP_POOL_VERSION=v1.6 bash install.sh
 relay
 ```
 
-管理脚本支持创建/删除转发、启动/停止实例、查看状态和日志、编辑配置、应用 TCP 调优、更新程序和卸载程序。
+管理脚本支持创建/修改/删除转发、启动/停止实例、查看状态和日志、编辑配置、应用 TCP 调优、更新程序和卸载程序。创建或修改转发时，可以选择是否配置高级参数；不配置则使用程序默认值，不会把默认高级参数写进配置文件。执行 `relay update` 会同步更新主程序和 `relay` 管理脚本，并保留已有配置。
 
 也可以直接使用子命令：
 
 ```bash
 relay add
+relay modify
 relay delete
 relay list
 relay restart

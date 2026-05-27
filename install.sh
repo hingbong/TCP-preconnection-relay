@@ -61,6 +61,23 @@ binary_works() {
     grep -q "ERROR: LOCAL_IP not set" <<< "$out"
 }
 
+install_binary_file() {
+    local src="$1"
+    local tmp
+
+    tmp="$(mktemp /root/tcp_pool.new.XXXXXX)"
+    cp "$src" "$tmp"
+    chmod +x "$tmp"
+
+    if ! binary_works "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mv -f "$tmp" /root/tcp_pool
+    return 0
+}
+
 is_repo_source_dir() {
     local dir="$1"
 
@@ -111,15 +128,12 @@ install_prebuilt_from_dir() {
     fi
 
     echo "使用仓库 dist 里的预编译二进制：$asset"
-    cp "$src" /root/tcp_pool
-    chmod +x /root/tcp_pool
-    if binary_works /root/tcp_pool; then
+    if install_binary_file "$src"; then
         echo "Prebuilt binary installed: $asset"
         return 0
     fi
 
     echo "预编译二进制无法在本机运行，回退到本地编译。"
-    rm -f /root/tcp_pool
     return 1
 }
 
@@ -140,12 +154,21 @@ install_from_source_dir() {
         cp "$src_file" "$dst_file"
     fi
 
-    if gcc -O2 -pthread -march=native -o /root/tcp_pool /root/tcp_pool.c; then
+    local tmp_bin
+    tmp_bin="$(mktemp /root/tcp_pool.build.XXXXXX)"
+
+    if gcc -O2 -pthread -march=native -o "$tmp_bin" /root/tcp_pool.c; then
         echo "Compile Succeeded"
     else
         echo "你的服务商太抠了，给你用这么一个古董CPU......"
-        gcc -O2 -pthread -march=x86-64 -mtune=generic -o /root/tcp_pool /root/tcp_pool.c
+        if ! gcc -O2 -pthread -march=x86-64 -mtune=generic -o "$tmp_bin" /root/tcp_pool.c; then
+            rm -f "$tmp_bin"
+            return 1
+        fi
     fi
+
+    chmod +x "$tmp_bin"
+    mv -f "$tmp_bin" /root/tcp_pool
 }
 
 install_program() {

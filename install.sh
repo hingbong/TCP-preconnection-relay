@@ -61,6 +61,20 @@ binary_works() {
     grep -q "ERROR: LOCAL_IP not set" <<< "$out"
 }
 
+is_repo_source_dir() {
+    local dir="$1"
+
+    [ -f "$dir/tcp_pool.c" ] || return 1
+    [ -f "$dir/install.sh" ] || return 1
+
+    if [ -d "$dir/.git" ]; then
+        return 0
+    fi
+
+    [ -f "$dir/build-release.sh" ] && [ -d "$dir/dist" ] && return 0
+    [ -f "$dir/README.md" ] && grep -q "TCP-preconnection-relay" "$dir/README.md" 2>/dev/null
+}
+
 clone_repo() {
     ensure_packages git ca-certificates
 
@@ -118,7 +132,13 @@ install_from_source_dir() {
         echo "缺少源码文件：$src_dir/tcp_pool.c" >&2
         exit 1
     fi
-    cp "$src_dir/tcp_pool.c" /root/tcp_pool.c
+
+    local src_file dst_file
+    src_file="$(readlink -f "$src_dir/tcp_pool.c")"
+    dst_file="$(readlink -m /root/tcp_pool.c)"
+    if [ "$src_file" != "$dst_file" ]; then
+        cp "$src_file" "$dst_file"
+    fi
 
     if gcc -O2 -pthread -march=native -o /root/tcp_pool /root/tcp_pool.c; then
         echo "Compile Succeeded"
@@ -132,7 +152,7 @@ install_program() {
     local src_dir=""
     local cloned_dir=""
 
-    if [ -f "$SCRIPT_DIR/tcp_pool.c" ] && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
+    if is_repo_source_dir "$SCRIPT_DIR" && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
         src_dir="$SCRIPT_DIR"
     else
         cloned_dir="$(clone_repo)"
@@ -146,7 +166,7 @@ install_program() {
     fi
 }
 
-if [ -f "$SCRIPT_DIR/tcp_pool.c" ] && [ "${TCP_POOL_PREBUILT:-0}" != "1" ] && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
+if is_repo_source_dir "$SCRIPT_DIR" && [ "${TCP_POOL_PREBUILT:-0}" != "1" ] && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
     install_from_source_dir "$SCRIPT_DIR"
 else
     install_program

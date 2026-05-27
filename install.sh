@@ -48,15 +48,9 @@ detect_prebuilt_arch() {
     esac
 }
 
-release_download_base() {
+repo_clone_url() {
     local repo="${TCP_POOL_REPO:-Xeloan/TCP-preconnection-relay}"
-    local version="${TCP_POOL_VERSION:-latest}"
-
-    if [ "$version" = "latest" ]; then
-        printf 'https://github.com/%s/releases/latest/download' "$repo"
-    else
-        printf 'https://github.com/%s/releases/download/%s' "$repo" "$version"
-    fi
+    printf 'https://github.com/%s.git' "$repo"
 }
 
 binary_works() {
@@ -67,7 +61,25 @@ binary_works() {
     grep -q "ERROR: LOCAL_IP not set" <<< "$out"
 }
 
-install_prebuilt_binary() {
+clone_repo() {
+    ensure_packages git ca-certificates
+
+    local dst
+    dst="$(mktemp -d /tmp/tcp-pool-src.XXXXXX)"
+
+    local version="${TCP_POOL_VERSION:-}"
+    if [ -n "$version" ] && [ "$version" != "latest" ]; then
+        git clone --depth 1 --branch "$version" "$(repo_clone_url)" "$dst"
+    else
+        git clone --depth 1 "$(repo_clone_url)" "$dst"
+    fi
+
+    printf '%s' "$dst"
+}
+
+install_prebuilt_from_dir() {
+    local src_dir="$1"
+
     [ "${TCP_POOL_PREBUILT:-1}" = "0" ] && return 1
 
     local arch
@@ -76,19 +88,16 @@ install_prebuilt_binary() {
         return 1
     fi
 
-    ensure_packages curl ca-certificates
-
     local asset="tcp_pool-$arch"
-    local url
-    url="$(release_download_base)/$asset"
+    local src="$src_dir/dist/$asset"
 
-    echo "尝试下载预编译二进制：$asset"
-    if ! curl -fL --connect-timeout 10 --retry 2 -o /root/tcp_pool "$url"; then
-        echo "预编译二进制下载失败，回退到本地编译。"
-        rm -f /root/tcp_pool
+    if [ ! -f "$src" ]; then
+        echo "仓库 dist 中没有当前架构预编译二进制：$asset，回退到本地编译。"
         return 1
     fi
 
+    echo "使用仓库 dist 里的预编译二进制：$asset"
+    cp "$src" /root/tcp_pool
     chmod +x /root/tcp_pool
     if binary_works /root/tcp_pool; then
         echo "Prebuilt binary installed: $asset"
@@ -100,15 +109,16 @@ install_prebuilt_binary() {
     return 1
 }
 
-install_from_source() {
-    ensure_packages curl ca-certificates build-essential
+install_from_source_dir() {
+    local src_dir="$1"
 
-    if [ -f "$SCRIPT_DIR/tcp_pool.c" ]; then
-        cp "$SCRIPT_DIR/tcp_pool.c" /root/tcp_pool.c
-    else
-        curl -L -o /root/tcp_pool.c \
-        https://raw.githubusercontent.com/Xeloan/TCP-preconnection-relay/main/tcp_pool.c
+    ensure_packages build-essential
+
+    if [ ! -f "$src_dir/tcp_pool.c" ]; then
+        echo "缺少源码文件：$src_dir/tcp_pool.c" >&2
+        exit 1
     fi
+    cp "$src_dir/tcp_pool.c" /root/tcp_pool.c
 
     if gcc -O2 -pthread -march=native -o /root/tcp_pool /root/tcp_pool.c; then
         echo "Compile Succeeded"
@@ -118,10 +128,28 @@ install_from_source() {
     fi
 }
 
-if [ -f "$SCRIPT_DIR/tcp_pool.c" ] && [ "${TCP_POOL_PREBUILT:-0}" != "1" ]; then
-    install_from_source
+install_program() {
+    local src_dir=""
+    local cloned_dir=""
+
+    if [ -f "$SCRIPT_DIR/tcp_pool.c" ] && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
+        src_dir="$SCRIPT_DIR"
+    else
+        cloned_dir="$(clone_repo)"
+        src_dir="$cloned_dir"
+    fi
+
+    install_prebuilt_from_dir "$src_dir" || install_from_source_dir "$src_dir"
+
+    if [ -n "$cloned_dir" ]; then
+        rm -rf "$cloned_dir"
+    fi
+}
+
+if [ -f "$SCRIPT_DIR/tcp_pool.c" ] && [ "${TCP_POOL_PREBUILT:-0}" != "1" ] && [ "${TCP_POOL_USE_GIT:-0}" != "1" ]; then
+    install_from_source_dir "$SCRIPT_DIR"
 else
-    install_prebuilt_binary || install_from_source
+    install_program
 fi
 
 ensure_packages nano

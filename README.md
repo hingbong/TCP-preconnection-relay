@@ -14,7 +14,7 @@
 curl -fsSL https://raw.githubusercontent.com/Xeloan/TCP-preconnection-relay/main/install.sh -o install.sh && bash install.sh
 ```
 
-安装脚本会优先下载 Release 里的预编译二进制，支持 `linux-amd64`、`linux-arm64`、`linux-armv7`、`linux-386`。如果下载失败、架构不匹配，或者二进制无法运行，会自动回退到本地编译。
+安装脚本会先安装 `git`，然后克隆仓库，优先读取仓库 `dist/` 里的同架构预编译二进制。当前预编译文件支持 `linux-amd64`、`linux-arm64`、`linux-armv7`，如果没有匹配架构，或者二进制无法运行，会自动回退到本地编译。
 
 如果想强制源码编译：
 
@@ -22,13 +22,13 @@ curl -fsSL https://raw.githubusercontent.com/Xeloan/TCP-preconnection-relay/main
 TCP_POOL_PREBUILT=0 bash install.sh
 ```
 
-如果要安装指定 tag 的预编译包：
+如果要安装指定 tag/branch 的仓库版本：
 
 ```bash
 TCP_POOL_VERSION=v1.6 bash install.sh
 ```
 
-维护者打 tag 后会通过 GitHub Actions 自动生成预编译文件。也可以在当前机器手动构建本机架构二进制：
+维护者可以通过 GitHub Actions 或本地脚本生成预编译文件并放入 `dist/`。也可以在当前机器手动构建本机架构二进制：
 
 ```bash
 ./build-release.sh

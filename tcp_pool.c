@@ -3,6 +3,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -34,16 +35,23 @@ static char *REMOTE_IP;
 static int REMOTE_TCP_PORT; //目标服务器TCP端口
 static int REMOTE_UDP_PORT; //目标服务器UDP端口
 
-#define POOL_SIZE       24 //连接池大小
-#define REFILL_BATCH    8 //预链接池补充最大线程
-#define CONNECT_TIMEOUT 5
-#define IDLE_TIMEOUT    240 //空闲tcp(被使用过后的)回收时长
-#define HALF_CLOSE_TIMEOUT 10 //半关闭态最多保留10秒
+#define MAX_POOL_SIZE 256
+#define DEFAULT_POOL_SIZE 24 //连接池大小
+#define DEFAULT_REFILL_BATCH 8 //预链接池补充最大线程
+#define DEFAULT_CONNECT_TIMEOUT 5
+#define DEFAULT_IDLE_TIMEOUT 240 //空闲tcp(被使用过后的)回收时长
+#define DEFAULT_HALF_CLOSE_TIMEOUT 10 //半关闭态最多保留10秒
+#define DEFAULT_PRECONNECT_TTL_MS 50000 //预连接轮换周期
 
-#define SPLICE_CHUNK (64 * 1024) //单次数据搬运量
+#define DEFAULT_SPLICE_CHUNK (256 * 1024) //单次数据搬运量
+#define MIN_SPLICE_CHUNK     (16 * 1024)
+#define MAX_SPLICE_CHUNK     (1024 * 1024)
 
 #define UDP_TABLE_SIZE      1024
-#define UDP_IDLE_TIMEOUT    60 //udp单端超时时长
+#define DEFAULT_UDP_IDLE_TIMEOUT 60 //udp单端超时时长
+#define DEFAULT_UDP_SOCKET_BUFFER (4 * 1024 * 1024)
+#define DEFAULT_LISTEN_BACKLOG 16384
+#define EPOLL_EVENTS_MAX 1024
 
 #define TAG_CONN_SIDE   ((uintptr_t)1)   //打tag
 #define TAG_UDP_ASSOC   ((uintptr_t)2)   
@@ -51,7 +59,28 @@ static int REMOTE_UDP_PORT; //目标服务器UDP端口
 #define TAG_UDP_LISTEN  ((void*)4)       
 
 static bool LOG_ENABLE = true;     //日志开关，懒，就做了一档
-#define LOG_RATE_PER_SEC 24        //每秒最多输出 24 条，多余排队
+#define DEFAULT_LOG_RATE_PER_SEC 24
+#define LOG_QUEUE_MAX 4096
+
+#ifndef TCP_USER_TIMEOUT
+#define TCP_USER_TIMEOUT 18
+#endif
+
+static int cfg_pool_size = DEFAULT_POOL_SIZE;
+static int cfg_refill_batch = DEFAULT_REFILL_BATCH;
+static int cfg_connect_timeout = DEFAULT_CONNECT_TIMEOUT;
+static int cfg_idle_timeout = DEFAULT_IDLE_TIMEOUT;
+static int cfg_half_close_timeout = DEFAULT_HALF_CLOSE_TIMEOUT;
+static int cfg_preconnect_ttl_ms = DEFAULT_PRECONNECT_TTL_MS;
+static size_t cfg_splice_chunk = DEFAULT_SPLICE_CHUNK;
+static int cfg_udp_idle_timeout = DEFAULT_UDP_IDLE_TIMEOUT;
+static int cfg_udp_socket_buffer = DEFAULT_UDP_SOCKET_BUFFER;
+static int cfg_listen_backlog = DEFAULT_LISTEN_BACKLOG;
+static int cfg_log_rate_per_sec = DEFAULT_LOG_RATE_PER_SEC;
+static int cfg_tcp_keepidle = 360;
+static int cfg_tcp_keepintvl = 15;
+static int cfg_tcp_keepcnt = 1;
+static int cfg_tcp_user_timeout_ms = 0;
 
 typedef struct LogNode {
     char *msg;
@@ -60,6 +89,8 @@ typedef struct LogNode {
 
 static pthread_mutex_t log_mtx = PTHREAD_MUTEX_INITIALIZER;
 static LogNode *log_head = NULL, *log_tail = NULL;
+static int log_queue_len = 0;
+static int log_dropped = 0;
 
 static void log_enqueue_v(const char *fmt, va_list ap) {//产生日志
     if (!LOG_ENABLE) return;
@@ -80,8 +111,16 @@ static void log_enqueue_v(const char *fmt, va_list ap) {//产生日志
     node->next = NULL;
 
     pthread_mutex_lock(&log_mtx);
+    if (log_queue_len >= LOG_QUEUE_MAX) {
+        log_dropped++;
+        pthread_mutex_unlock(&log_mtx);
+        free(node->msg);
+        free(node);
+        return;
+    }
     if (!log_tail) log_head = log_tail = node;
     else { log_tail->next = node; log_tail = node; }
+    log_queue_len++;
     pthread_mutex_unlock(&log_mtx);
 }
 
@@ -97,13 +136,46 @@ static void log_flush_rate_limited(uint64_t now_ms) {//日志限速
     if (!LOG_ENABLE) return;
 
     static uint64_t cur_sec = 0;
-    static int quota = LOG_RATE_PER_SEC;
+    static int quota = DEFAULT_LOG_RATE_PER_SEC;
 
     uint64_t sec = now_ms / 1000ULL;
-    if (sec != cur_sec) { cur_sec = sec; quota = LOG_RATE_PER_SEC; }
-    if (quota <= 0) return;
+    if (sec != cur_sec) { cur_sec = sec; quota = cfg_log_rate_per_sec; }
+    if (quota <= 0) {
+        LogNode *nodes = NULL;
+        pthread_mutex_lock(&log_mtx);
+        nodes = log_head;
+        log_head = log_tail = NULL;
+        log_dropped += log_queue_len;
+        log_queue_len = 0;
+        pthread_mutex_unlock(&log_mtx);
+        while (nodes) {
+            LogNode *next = nodes->next;
+            free(nodes->msg);
+            free(nodes);
+            nodes = next;
+        }
+        return;
+    }
 
     while (quota > 0) {
+        int dropped = 0;
+
+        pthread_mutex_lock(&log_mtx);
+        dropped = log_dropped;
+        log_dropped = 0;
+        pthread_mutex_unlock(&log_mtx);
+
+        if (dropped > 0) {
+            char buf[96];
+            int n = snprintf(buf, sizeof(buf), "Log dropped: %d", dropped);
+            if (n > 0) {
+                (void)write(STDOUT_FILENO, buf, (size_t)n);
+                (void)write(STDOUT_FILENO, "\n", 1);
+                quota--;
+                continue;
+            }
+        }
+
         LogNode *node = NULL;
 
         pthread_mutex_lock(&log_mtx);
@@ -111,6 +183,7 @@ static void log_flush_rate_limited(uint64_t now_ms) {//日志限速
             node = log_head;
             log_head = log_head->next;
             if (!log_head) log_tail = NULL;
+            log_queue_len--;
         }
         pthread_mutex_unlock(&log_mtx);
 
@@ -126,6 +199,18 @@ static void log_flush_rate_limited(uint64_t now_ms) {//日志限速
 
 static void log_flush_all_force(void) {
     if (!LOG_ENABLE) return;
+    pthread_mutex_lock(&log_mtx);
+    int dropped = log_dropped;
+    log_dropped = 0;
+    pthread_mutex_unlock(&log_mtx);
+    if (dropped > 0) {
+        char buf[96];
+        int n = snprintf(buf, sizeof(buf), "Log dropped: %d", dropped);
+        if (n > 0) {
+            (void)write(STDOUT_FILENO, buf, (size_t)n);
+            (void)write(STDOUT_FILENO, "\n", 1);
+        }
+    }
     while (1) {
         LogNode *node = NULL;
 
@@ -134,6 +219,7 @@ static void log_flush_all_force(void) {
             node = log_head;
             log_head = log_head->next;
             if (!log_head) log_tail = NULL;
+            log_queue_len--;
         }
         pthread_mutex_unlock(&log_mtx);
 
@@ -147,6 +233,59 @@ static void log_flush_all_force(void) {
 }
 
 //工具函数
+static int parse_env_int(const char *name, int def, int min, int max) {
+    const char *val = getenv(name);
+    if (!val || !*val) return def;
+
+    errno = 0;
+    char *end = NULL;
+    long n = strtol(val, &end, 10);
+    if (errno != 0 || end == val || *end != '\0') {
+        fprintf(stderr, "WARN: invalid %s=%s, using %d\n", name, val, def);
+        return def;
+    }
+    if (n < min) n = min;
+    if (n > max) n = max;
+    return (int)n;
+}
+
+static bool parse_env_bool(const char *name, bool def) {
+    const char *val = getenv(name);
+    if (!val || !*val) return def;
+    if (strcmp(val, "0") == 0 || strcasecmp(val, "false") == 0 ||
+        strcasecmp(val, "no") == 0 || strcasecmp(val, "off") == 0) {
+        return false;
+    }
+    if (strcmp(val, "1") == 0 || strcasecmp(val, "true") == 0 ||
+        strcasecmp(val, "yes") == 0 || strcasecmp(val, "on") == 0) {
+        return true;
+    }
+    fprintf(stderr, "WARN: invalid %s=%s, using %s\n", name, val, def ? "on" : "off");
+    return def;
+}
+
+static void load_runtime_config(void) {
+    cfg_pool_size = parse_env_int("POOL_SIZE", DEFAULT_POOL_SIZE, 0, MAX_POOL_SIZE);
+    cfg_refill_batch = parse_env_int("REFILL_BATCH", DEFAULT_REFILL_BATCH, 1, MAX_POOL_SIZE);
+    if (cfg_refill_batch > cfg_pool_size && cfg_pool_size > 0) cfg_refill_batch = cfg_pool_size;
+    cfg_connect_timeout = parse_env_int("CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT, 1, 120);
+    cfg_idle_timeout = parse_env_int("IDLE_TIMEOUT", DEFAULT_IDLE_TIMEOUT, 30, 86400);
+    cfg_half_close_timeout = parse_env_int("HALF_CLOSE_TIMEOUT", DEFAULT_HALF_CLOSE_TIMEOUT, 1, 300);
+    cfg_preconnect_ttl_ms = parse_env_int("PRECONNECT_TTL_MS", DEFAULT_PRECONNECT_TTL_MS, 10000, 3600000);
+    cfg_splice_chunk = (size_t)parse_env_int("SPLICE_CHUNK", DEFAULT_SPLICE_CHUNK,
+                                             MIN_SPLICE_CHUNK, MAX_SPLICE_CHUNK);
+    cfg_udp_idle_timeout = parse_env_int("UDP_IDLE_TIMEOUT", DEFAULT_UDP_IDLE_TIMEOUT, 5, 3600);
+    cfg_udp_socket_buffer = parse_env_int("UDP_SOCKET_BUFFER", DEFAULT_UDP_SOCKET_BUFFER,
+                                          64 * 1024, 64 * 1024 * 1024);
+    cfg_listen_backlog = parse_env_int("LISTEN_BACKLOG", DEFAULT_LISTEN_BACKLOG, 128, 65535);
+    cfg_log_rate_per_sec = parse_env_int("LOG_RATE_PER_SEC", DEFAULT_LOG_RATE_PER_SEC, 0, 10000);
+    cfg_tcp_keepidle = parse_env_int("TCP_KEEPIDLE", 360, 30, 86400);
+    cfg_tcp_keepintvl = parse_env_int("TCP_KEEPINTVL", 15, 1, 3600);
+    cfg_tcp_keepcnt = parse_env_int("TCP_KEEPCNT", 1, 1, 30);
+    cfg_tcp_user_timeout_ms = parse_env_int("TCP_USER_TIMEOUT_MS", 0, 0, 3600000);
+    LOG_ENABLE = parse_env_bool("LOG_ENABLE", true);
+}
+
 static int resolve_addr(const char *host, int port, int socktype,
                         struct sockaddr_storage *out, socklen_t *outlen) {
     struct addrinfo hints, *res = NULL, *rp = NULL;
@@ -189,25 +328,43 @@ static inline void safe_close(int *fd) {//安全关闭连接
     if (*fd >= 0) { close(*fd); *fd = -1; }
 }
 
+static void set_common_socket_options(int fd) {
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+}
+
 static void set_tcp_socket_options(int fd) {//TCP优化参数,缓冲区按照内核的来，不另外设置
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
 
-    int idle = 360, intvl = 15, cnt = 1;
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &cfg_tcp_keepidle, sizeof(cfg_tcp_keepidle));
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &cfg_tcp_keepintvl, sizeof(cfg_tcp_keepintvl));
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cfg_tcp_keepcnt, sizeof(cfg_tcp_keepcnt));
+    if (cfg_tcp_user_timeout_ms > 0) {
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                         &cfg_tcp_user_timeout_ms, sizeof(cfg_tcp_user_timeout_ms));
+    }
 
     (void)setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 }
 
 static void set_udp_socket_options(int fd) {
     //UDP缓冲
-    int rcv = 4 * 1024 * 1024;
-    int snd = 4 * 1024 * 1024;
+    int rcv = cfg_udp_socket_buffer;
+    int snd = cfg_udp_socket_buffer;
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof(rcv));
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
+}
+
+static void grow_pipe_capacity(int pipefd[2]) {
+#ifdef F_SETPIPE_SZ
+    int target = (cfg_splice_chunk > (size_t)INT_MAX) ? INT_MAX : (int)cfg_splice_chunk;
+    (void)fcntl(pipefd[0], F_SETPIPE_SZ, target);
+    (void)fcntl(pipefd[1], F_SETPIPE_SZ, target);
+#else
+    (void)pipefd;
+#endif
 }
 
 //连接池僵尸连接探测
@@ -241,10 +398,12 @@ typedef struct { int fd; uint64_t birth_ms; } pool_item_t;
 static pool_item_t pool[256];
 static int pool_count = 0;
 static int pending_cnt = 0;
+static int refill_fail_streak = 0;
+static uint64_t refill_pause_until = 0;
 static pthread_mutex_t pool_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static bool pool_put_locked(int fd, uint64_t now_ms) {//建立好的连接放在连接池里备用
-    if (pool_count < POOL_SIZE) {
+    if (pool_count < cfg_pool_size) {
         pool[pool_count].fd = fd;
         pool[pool_count].birth_ms = now_ms;
         pool_count++;
@@ -261,7 +420,6 @@ static int pool_get_locked(void) {//取连接
 
 static void *thread_refill(void *arg) {//连接线程补充
     (void)arg;
-//打个标，我在这改过，防止忘了
 
     int s = socket(((struct sockaddr*)&remote_tcp_addr)->sa_family, SOCK_STREAM, 0);
     if (s < 0) goto fin;
@@ -274,7 +432,7 @@ static void *thread_refill(void *arg) {//连接线程补充
     if (errno != EINPROGRESS) { close(s); goto fin; }
 
     struct pollfd pfd = { .fd = s, .events = POLLOUT };
-    if (poll(&pfd, 1, CONNECT_TIMEOUT * 1000) > 0) {
+    if (poll(&pfd, 1, cfg_connect_timeout * 1000) > 0) {
         int err = 0;
         socklen_t len = sizeof(err);
         getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
@@ -289,8 +447,10 @@ success: {
     pthread_mutex_lock(&pool_mtx);
 
     pending_cnt--;
+    refill_fail_streak = 0;
+    refill_pause_until = 0;
     bool ok = pool_put_locked(s, now);
-    if (ok) log_enqueue("Preconnect +1，Current: %d/%d (Pending: %d)", pool_count, POOL_SIZE, pending_cnt);
+    if (ok) log_enqueue("Preconnect +1，Current: %d/%d (Pending: %d)", pool_count, cfg_pool_size, pending_cnt);
     else log_enqueue("Preconnected Too Much, Clearing ...");
 
     pthread_mutex_unlock(&pool_mtx);
@@ -300,6 +460,12 @@ success: {
 fin:
     pthread_mutex_lock(&pool_mtx);
     pending_cnt--;
+    refill_fail_streak++;
+    if (refill_fail_streak >= cfg_refill_batch) {
+        int backoff_ms = 200 * refill_fail_streak;
+        if (backoff_ms > 5000) backoff_ms = 5000;
+        refill_pause_until = mono_ms() + (uint64_t)backoff_ms;
+    }
     pthread_mutex_unlock(&pool_mtx);
     return NULL;
 }
@@ -320,16 +486,16 @@ static void *thread_maintain(void *arg) {//自动补充连接，以及连接每5
         }
 
         for (int i = pool_count - 1; i >= 0; i--) {
-            if ((now - pool[i].birth_ms) > 50000) {
+            if ((now - pool[i].birth_ms) > (uint64_t)cfg_preconnect_ttl_ms) {
                 close(pool[i].fd);
                 pool[i] = pool[--pool_count];
-                log_enqueue("Checking: 50s rotating");
+                log_enqueue("Checking: preconnect rotating");
             }
-        }//50s后没被使用的连接主动断掉重新开
+        }//预连接到期后主动断掉重新开
 
-        int deficit = POOL_SIZE - (pool_count + pending_cnt);
-        if (deficit > 0) {
-            int want = (deficit > REFILL_BATCH) ? REFILL_BATCH : deficit;
+        int deficit = cfg_pool_size - (pool_count + pending_cnt);
+        if (deficit > 0 && now >= refill_pause_until) {
+            int want = (deficit > cfg_refill_batch) ? cfg_refill_batch : deficit;
             for (int k = 0; k < want; k++) {
                 pthread_t t;
                 int prc = pthread_create(&t, NULL, thread_refill, NULL);
@@ -386,11 +552,11 @@ static void conn_watch(Conn *c) {
     //只在未收到EOF的方向上监听EPOLLRDHUP
     if (!c->eof_l2r) {
         ev_l |= EPOLLRDHUP;
-        if (c->len_l2r < SPLICE_CHUNK) ev_l |= EPOLLIN;
+        if (c->len_l2r < cfg_splice_chunk) ev_l |= EPOLLIN;
     }
     if (!c->eof_r2l) {
         ev_r |= EPOLLRDHUP;
-        if (c->len_r2l < SPLICE_CHUNK) ev_r |= EPOLLIN;
+        if (c->len_r2l < cfg_splice_chunk) ev_r |= EPOLLIN;
     }
     if (c->len_l2r > 0) ev_r |= EPOLLOUT;
     if (c->len_r2l > 0) ev_l |= EPOLLOUT;
@@ -411,14 +577,14 @@ static pump_status_t pump(int src_fd, int dst_fd, int pipe_in, int pipe_out,//�
                           size_t *pipe_len, uint64_t now_ms, uint64_t *last_ts) {
     bool got_eof = false;
 
-    while (*pipe_len < SPLICE_CHUNK) {
+    while (*pipe_len < cfg_splice_chunk) {
         ssize_t n = splice(src_fd, NULL, pipe_in, NULL,
-                           (SPLICE_CHUNK - *pipe_len),
+                           (cfg_splice_chunk - *pipe_len),
                            SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (n > 0) {
             *pipe_len += (size_t)n;
             *last_ts = now_ms;
-            if (*pipe_len >= SPLICE_CHUNK) break;
+            if (*pipe_len >= cfg_splice_chunk) break;
         } else if (n == 0) {
             got_eof = true;
             break;  //收到EOF，但先不返回，继续把pipe里的数据刷到目标
@@ -546,6 +712,8 @@ static void udp_remove(UdpAssoc *u, uint32_t idx, int epfd_) {
 
 int main() {
     char *env;
+    load_runtime_config();
+
     LOCAL_IP = getenv("LOCAL_IP");
     if (!LOCAL_IP) {
         fprintf(stderr, "ERROR: LOCAL_IP not set\n");
@@ -574,8 +742,11 @@ int main() {
         exit(1);
     }
     REMOTE_UDP_PORT = atoi(env);
-    printf("Using config: %s:%d → %d/%d\n",
+    printf("Using config: %s:%d -> %d/%d\n",
        REMOTE_IP, REMOTE_TCP_PORT, REMOTE_TCP_PORT, REMOTE_UDP_PORT);
+    printf("Runtime: pool=%d refill=%d splice=%zu backlog=%d udp_buf=%d log=%s\n",
+           cfg_pool_size, cfg_refill_batch, cfg_splice_chunk, cfg_listen_backlog,
+           cfg_udp_socket_buffer, LOG_ENABLE ? "on" : "off");
     if (resolve_addr(LOCAL_IP, LOCAL_PORT, SOCK_STREAM, &local_bind_addr, &local_bind_addrlen) != 0) {
         fprintf(stderr, "ERROR: resolve LOCAL_IP failed: %s:%d\n", LOCAL_IP, LOCAL_PORT);
         exit(1);
@@ -594,9 +765,11 @@ int main() {
     (void)setrlimit(RLIMIT_NOFILE, &r);
     signal(SIGPIPE, SIG_IGN);
 
-    pthread_t t_m;
-    pthread_create(&t_m, NULL, thread_maintain, NULL);
-    pthread_detach(t_m);
+    if (cfg_pool_size > 0) {
+        pthread_t t_m;
+        pthread_create(&t_m, NULL, thread_maintain, NULL);
+        pthread_detach(t_m);
+    }
 
     epfd = epoll_create1(0);
     if (epfd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
@@ -604,13 +777,10 @@ int main() {
     int listen_fd = socket(((struct sockaddr*)&local_bind_addr)->sa_family, SOCK_STREAM, 0);//tcp监听
     if (listen_fd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
 
-    int one = 1;
-    (void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    set_common_socket_options(listen_fd);
     if (set_nonblock(listen_fd) != 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
 
-//打个标
-
-    if (bind(listen_fd, (struct sockaddr*)&local_bind_addr, local_bind_addrlen) < 0 || listen(listen_fd, 4096) < 0) {
+    if (bind(listen_fd, (struct sockaddr*)&local_bind_addr, local_bind_addrlen) < 0 || listen(listen_fd, cfg_listen_backlog) < 0) {
         log_enqueue("socket listen failed");
         log_flush_all_force();
         return 1;
@@ -628,15 +798,13 @@ int main() {
     udp_listen_fd = socket(((struct sockaddr*)&local_bind_addr)->sa_family, SOCK_DGRAM, 0);
     if (udp_listen_fd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
     set_udp_socket_options(udp_listen_fd);
-    (void)setsockopt(udp_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    set_common_socket_options(udp_listen_fd);
     if (set_nonblock(udp_listen_fd) != 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
     if (bind(udp_listen_fd, (struct sockaddr*)&local_bind_addr, local_bind_addrlen) < 0) {
         log_enqueue("socket listen failed");
         log_flush_all_force();
         return 1;
     }
-
-//打个标
 
     ev.events = EPOLLIN | EPOLLET;
     ev.data.ptr = TAG_UDP_LISTEN;
@@ -646,10 +814,10 @@ int main() {
         return 1;
     }
 
-    struct epoll_event events[256];
+    struct epoll_event events[EPOLL_EVENTS_MAX];
 
     while (1) {
-        int nfds = epoll_wait(epfd, events, 256, 100);
+        int nfds = epoll_wait(epfd, events, EPOLL_EVENTS_MAX, 100);
         uint64_t now = mono_ms();
         log_flush_rate_limited(now);
 
@@ -666,20 +834,20 @@ int main() {
                     }
                     set_tcp_socket_options(cli);
 
-                    pthread_mutex_lock(&pool_mtx);
-                    int rem = pool_get_locked();
-                    pthread_mutex_unlock(&pool_mtx);
+                    int rem = -1;
+                    if (cfg_pool_size > 0) {
+                        pthread_mutex_lock(&pool_mtx);
+                        rem = pool_get_locked();
+                        pthread_mutex_unlock(&pool_mtx);
+                    }
                     bool connecting = false;
                     if (rem < 0) {//如果并发太高了，那么直接按照传统方式转发连接
                         log_enqueue("Exceeded Connections Pool, Direct Out...");
-
-//打个标
 
                         rem = socket(((struct sockaddr*)&remote_tcp_addr)->sa_family, SOCK_STREAM, 0);
                         if (rem < 0) { close(cli); continue; }
                         set_tcp_socket_options(rem);
                         if (set_nonblock(rem) != 0) { close(rem); close(cli); continue; }
-                        //fallback这里问题调整了一下///////////////////////////////////QAQ
                         int rc = connect(rem, (struct sockaddr*)&remote_tcp_addr, remote_tcp_addrlen);
                         if (rc != 0) {
                             if (errno != EINPROGRESS) {
@@ -707,6 +875,8 @@ int main() {
                         free(c);
                         continue;
                     }
+                    grow_pipe_capacity(c->pipe_l2r);
+                    grow_pipe_capacity(c->pipe_r2l);
 
                     struct epoll_event ev_c;
 
@@ -908,22 +1078,22 @@ int main() {
 
                 uint64_t last_any = (cur->last_l2r > cur->last_r2l) ? cur->last_l2r : cur->last_r2l;
                 bool timeout = (!cur->connecting) &&
-                            (now - last_any > (uint64_t)IDLE_TIMEOUT * 1000ULL);
+                            (now - last_any > (uint64_t)cfg_idle_timeout * 1000ULL);
                 bool half_close_timeout = (cur->eof_l2r != cur->eof_r2l) &&
                             cur->half_close_since > 0 &&
-                            (now - cur->half_close_since > (uint64_t)HALF_CLOSE_TIMEOUT * 1000ULL);
+                            (now - cur->half_close_since > (uint64_t)cfg_half_close_timeout * 1000ULL);
                 if (cur->connecting &&
-                    now - cur->connect_start > (uint64_t)CONNECT_TIMEOUT * 1000ULL) {
+                    now - cur->connect_start > (uint64_t)cfg_connect_timeout * 1000ULL) {
                     log_enqueue("Connect timeout");
                     conn_close(cur);
                 }
                 if (cur->closed || timeout || half_close_timeout) {
                     if (half_close_timeout && !cur->closed) {
-                        log_enqueue("Half-close timeout(%ds)", HALF_CLOSE_TIMEOUT);
+                        log_enqueue("Half-close timeout(%ds)", cfg_half_close_timeout);
                         conn_close(cur);
                     } else if (timeout && !cur->closed) {
-                        log_enqueue("Timeout(%ds): Local->Remote", IDLE_TIMEOUT);
-                        log_enqueue("Timeout(%ds): Remote->Local", IDLE_TIMEOUT);
+                        log_enqueue("Timeout(%ds): Local->Remote", cfg_idle_timeout);
+                        log_enqueue("Timeout(%ds): Remote->Local", cfg_idle_timeout);
                         conn_close(cur);
                     } else if (!cur->closed) {
                         conn_close(cur);
@@ -945,7 +1115,7 @@ int main() {
                 UdpAssoc *p = udp_tab[i];
                 while (p) {
                     UdpAssoc *nxt = p->next;
-                    if (now - p->last_act > (uint64_t)UDP_IDLE_TIMEOUT * 1000ULL) {
+                    if (now - p->last_act > (uint64_t)cfg_udp_idle_timeout * 1000ULL) {
                         udp_remove(p, i, epfd);
                     }
                     p = nxt;

@@ -21,6 +21,7 @@ fn bfd(fd: RawFd) -> BorrowedFd<'static> {
 struct PoolEntry {
     fd: RawFd,
     birth: Instant,
+    ttl_ms: u64,
 }
 
 pub struct Pool {
@@ -31,6 +32,9 @@ pub struct Pool {
     pub pending: usize,
     fail_streak: usize,
     pub pause_until: Option<Instant>,
+    /// Xorshift64 state for cheap ±25 % TTL jitter — keeps all pre-connects
+    /// from expiring simultaneously and triggering a connection burst.
+    rng: u64,
 }
 
 impl Pool {
@@ -41,14 +45,33 @@ impl Pool {
             pending: 0,
             fail_streak: 0,
             pause_until: None,
+            rng: 0x517cc1b727220a95,
         }
     }
 
-    pub fn put(&mut self, fd: RawFd, now: Instant) {
+    /// Xorshift64 — fast, non-crypto, good enough for jitter.
+    fn next_rng(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    /// Jitter base_ms by ±25 %: output is in [0.75 × base, 1.25 × base].
+    fn jittered_ttl(&mut self, base_ms: u64) -> u64 {
+        let quarter = base_ms / 4;
+        let span = quarter * 2 + 1; // range width
+        base_ms - quarter + (self.next_rng() % span)
+    }
+
+    pub fn put(&mut self, fd: RawFd, now: Instant, base_ttl_ms: u64) -> bool {
         if self.entries.len() < self.max_size {
-            self.entries.push(PoolEntry { fd, birth: now });
+            let ttl_ms = self.jittered_ttl(base_ttl_ms);
+            self.entries.push(PoolEntry { fd, birth: now, ttl_ms });
+            true
         } else {
             let _ = nix::unistd::close(fd);
+            false
         }
     }
 
@@ -104,17 +127,18 @@ pub fn spawn_maintain_thread(
         p.entries.retain(|entry| {
             if sock::socket_dead_fast(entry.fd) {
                 let _ = nix::unistd::close(entry.fd);
+                log::push("Checking: Clear Zombies".into());
                 false
             } else {
                 true
             }
         });
 
-        // Rotate expired preconnects
-        let ttl = Duration::from_millis(cfg.preconnect_ttl_ms);
+        // Rotate expired preconnects (per-entry TTL avoids mass-expiry bursts)
         p.entries.retain(|entry| {
-            if now - entry.birth > ttl {
+            if now.duration_since(entry.birth).as_millis() as u64 > entry.ttl_ms {
                 let _ = nix::unistd::close(entry.fd);
+                log::push("Checking: preconnect rotating".into());
                 false
             } else {
                 true
@@ -201,13 +225,17 @@ fn connect_success(fd: RawFd, pool: &Mutex<Pool>, cfg: &Config) {
     p.pending = p.pending.saturating_sub(1);
     p.fail_streak = 0;
     p.pause_until = None;
-    p.put(fd, now);
-    let pool_count = p.entries.len();
-    let pending = p.pending;
-    log::push(format!(
-        "Preconnect +1, Current: {pool_count}/{} (Pending: {pending})",
-        cfg.pool_size,
-    ));
+    let ok = p.put(fd, now, cfg.preconnect_ttl_ms);
+    if ok {
+        let pool_count = p.entries.len();
+        let pending = p.pending;
+        log::push(format!(
+            "Preconnect +1, Current: {pool_count}/{} (Pending: {pending})",
+            cfg.pool_size,
+        ));
+    } else {
+        log::push("Preconnected Too Much, Clearing ...".into());
+    }
 }
 
 fn connect_fail(pool: &Mutex<Pool>, cfg: &Config) {

@@ -91,7 +91,8 @@ pub fn socket_dead_fast(fd: RawFd) -> bool {
                 return true;
             }
             // POLLIN without an error flag can mean FIN was received.
-            // A zero-byte MSG_PEEK recv confirms EOF.
+            // A zero-byte MSG_PEEK recv confirms EOF; negative with a real
+            // error (not EAGAIN/EWOULDBLOCK) also means the socket is dead.
             if revents.contains(PollFlags::POLLIN) {
                 let mut byte = [0u8; 1];
                 let n = unsafe {
@@ -102,7 +103,31 @@ pub fn socket_dead_fast(fd: RawFd) -> bool {
                         libc::MSG_PEEK | libc::MSG_DONTWAIT,
                     )
                 };
-                return n == 0; // 0 = EOF (FIN received)
+                if n == 0 {
+                    return true; // EOF (FIN received)
+                }
+                if n < 0 {
+                    let e = unsafe { *libc::__errno_location() };
+                    if e != libc::EAGAIN && e != libc::EWOULDBLOCK {
+                        return true; // real socket error
+                    }
+                }
+            }
+            // Final SO_ERROR sweep — catches sockets that were reset between
+            // the poll() call and now (matches the C getsockopt check).
+            let mut err: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    &mut err as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            if rc == 0 && err != 0 {
+                return true;
             }
             false
         }

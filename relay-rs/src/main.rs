@@ -8,6 +8,7 @@ mod log;
 mod pool;
 mod sock;
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::io::FromRawFd;
@@ -194,6 +195,7 @@ fn conn_watch(conn: &Conn, registry: &Registry, slab_idx: usize) {
 
 struct UdpAssoc {
     cli_addr: SockAddr,
+    cli_net_addr: std::net::SocketAddr,
     up_fd: RawFd,
     last_act: Instant,
     #[allow(dead_code)] // stored for potential introspection/debugging
@@ -304,6 +306,7 @@ fn main() {
         free.push_back(idx);
     }
 
+    let mut udp_map: HashMap<std::net::SocketAddr, usize> = HashMap::new();
     let mut udp_slots: Vec<Option<UdpAssoc>> = Vec::new();
     let mut udp_free: VecDeque<usize> = VecDeque::new();
     let mut events = Events::with_capacity(1024);
@@ -336,6 +339,7 @@ fn main() {
                             let (rem_fd, connecting) = if let Some(fd) = rem_opt {
                                 (fd, false)
                             } else {
+                                log::push("Exceeded Connections Pool, Direct Out...".into());
                                 match direct_connect(&remote_tcp_addr, &cfg) {
                                     Ok(fd) => (fd, true),
                                     Err(_) => {
@@ -442,13 +446,23 @@ fn main() {
                     .map(|(_, addr)| addr)
                     .unwrap();
 
-                    // Find existing upstream for this client; extract up_fd as a
-                    // Copy value so the mutable borrow on udp_slots ends here,
-                    // allowing insertion into udp_slots in the else branch.
-                    let found_up_fd = udp_slots.iter_mut()
-                        .filter_map(|s| s.as_mut())
-                        .find(|a| sock::sockaddr_eq(&a.cli_addr, &cli_sock_addr))
-                        .map(|a| { a.last_act = now; a.up_fd });
+                    // O(1) lookup via hash map keyed on the client's SocketAddr.
+                    let cli_net = cli_sock_addr.as_socket();
+                    let found_up_fd = if let Some(net_addr) = cli_net {
+                        if let Some(&slot_idx) = udp_map.get(&net_addr) {
+                            udp_slots.get_mut(slot_idx)
+                                .and_then(|s| s.as_mut())
+                                .map(|a| { a.last_act = now; a.up_fd })
+                        } else {
+                            None
+                        }
+                    } else {
+                        // Non-IP address family: fall back to linear scan.
+                        udp_slots.iter_mut()
+                            .filter_map(|s| s.as_mut())
+                            .find(|a| sock::sockaddr_eq(&a.cli_addr, &cli_sock_addr))
+                            .map(|a| { a.last_act = now; a.up_fd })
+                    };
 
                     if let Some(up_fd) = found_up_fd {
                         let _ = send(up_fd, &buf[..n], MsgFlags::MSG_DONTWAIT);
@@ -481,8 +495,15 @@ fn main() {
                                     continue;
                                 }
                                 let _ = send(up_fd, &buf[..n], MsgFlags::MSG_DONTWAIT);
+                                if let Some(net_addr) = cli_net {
+                                    udp_map.insert(net_addr, slot_idx);
+                                }
+                                let cli_net_addr = cli_net.unwrap_or(
+                                    std::net::SocketAddr::from(([0u8, 0, 0, 0], 0))
+                                );
                                 udp_slots[slot_idx] = Some(UdpAssoc {
                                     cli_addr: cli_sock_addr,
+                                    cli_net_addr,
                                     up_fd,
                                     last_act: now,
                                     token: t,
@@ -715,7 +736,10 @@ fn main() {
                             log::push(format!("Timeout({}s): Remote->Local", cfg.idle_timeout));
                             true
                         } else if let Some(hs) = conn.half_close_since {
-                            now - hs > Duration::from_secs(cfg.half_close_timeout)
+                            if now - hs > Duration::from_secs(cfg.half_close_timeout) {
+                                log::push(format!("Half-close timeout({}s)", cfg.half_close_timeout));
+                                true
+                            } else { false }
                         } else { false }
                     } else { false }
                 } else { false };
@@ -736,8 +760,10 @@ fn main() {
                 if let Some(ref assoc) = *slot {
                     if now - assoc.last_act > Duration::from_secs(cfg.udp_idle_timeout) {
                         let up_fd = assoc.up_fd;
+                        let net_addr = assoc.cli_net_addr;
                         let _ = poll.registry().deregister(&mut SourceFd(&up_fd));
                         let _ = nix::unistd::close(up_fd);
+                        udp_map.remove(&net_addr);
                         *slot = None;
                         udp_free.push_back(slot_idx);
                     }

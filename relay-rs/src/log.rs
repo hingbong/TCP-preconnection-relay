@@ -10,6 +10,7 @@ pub struct Logger {
     quota: usize,
     pub enabled: bool,
     pub rate: usize,
+    dropped: usize,
 }
 
 impl Logger {
@@ -20,6 +21,7 @@ impl Logger {
             quota: 0,
             enabled: true,
             rate: 24,
+            dropped: 0,
         }
     }
 
@@ -34,9 +36,12 @@ impl Logger {
     }
 
     /// Call this from the event loop. Flushes up to `self.rate` lines per second.
+    /// When lines are discarded due to rate-limiting, a "Log dropped: N" notice is
+    /// emitted on the next flush — matching the C version's log_dropped behaviour.
     pub fn maybe_flush(&mut self) {
         if !self.enabled || self.rate == 0 {
             if !self.buf.is_empty() {
+                self.dropped += self.buf.lines().count();
                 self.buf.clear();
             }
             return;
@@ -50,7 +55,18 @@ impl Logger {
             self.last_sec = sec;
             self.quota = self.rate;
         }
+
+        // Emit the dropped-count notice first (one quota slot), as the C version does.
+        if self.dropped > 0 && self.quota > 0 {
+            let mut out = io::stdout().lock();
+            let _ = writeln!(out, "Log dropped: {}", self.dropped);
+            let _ = out.flush();
+            self.dropped = 0;
+            self.quota -= 1;
+        }
+
         if self.quota == 0 {
+            self.dropped += self.buf.lines().count();
             self.buf.clear();
             return;
         }
@@ -62,13 +78,18 @@ impl Logger {
         }
 
         let mut out = io::stdout().lock();
-        for line in to_flush.lines() {
-            if self.quota == 0 {
-                break;
+        let mut lines_iter = to_flush.lines().peekable();
+        while self.quota > 0 {
+            match lines_iter.next() {
+                Some(line) => {
+                    let _ = writeln!(out, "{line}");
+                    self.quota -= 1;
+                }
+                None => break,
             }
-            let _ = writeln!(out, "{line}");
-            self.quota -= 1;
         }
+        // Any lines that didn't fit within the quota are counted as dropped.
+        self.dropped += lines_iter.count();
         let _ = out.flush();
     }
 

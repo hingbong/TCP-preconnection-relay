@@ -16,21 +16,12 @@ pub fn set_tcp_options(sock: &Socket, cfg: &Config) {
     }
     let _ = sock.set_tcp_keepalive(&ka);
 
-    // TCP_USER_TIMEOUT — raw setsockopt (not in nix 0.29 sockopt constants)
+    // TCP_USER_TIMEOUT — socket2 safe API
     if cfg.tcp_user_timeout_ms > 0 {
-        let fd = sock.as_raw_fd();
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_USER_TIMEOUT,
-                &cfg.tcp_user_timeout_ms as *const _ as *const libc::c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
-        }
+        let _ = sock.set_tcp_user_timeout(Some(Duration::from_millis(cfg.tcp_user_timeout_ms as u64)));
     }
 
-    // TCP_QUICKACK — raw setsockopt
+    // TCP_QUICKACK — only available via raw setsockopt
     let fd = sock.as_raw_fd();
     let one: i32 = 1;
     unsafe {

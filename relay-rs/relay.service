@@ -1,0 +1,17 @@
+[Unit]
+Description=TCP/UDP preconnection relay service
+After=network.target nss-lookup.target network-online.target
+
+[Service]
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=99
+Type=simple
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+Restart=always
+ExecStartPre=/usr/bin/sleep 1s
+ExecStart=/usr/local/bin/relay -c /etc/relay/relay.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target

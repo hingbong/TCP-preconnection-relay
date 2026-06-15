@@ -1,0 +1,37 @@
+# relay.toml — sample config (all values optional, defaults shown)
+#
+# Usage: relay -c relay.toml
+# Env vars and CLI args override these values.
+
+# Required
+local_ip = "0.0.0.0"
+local_port = 1234
+remote_ip = "1.2.3.4"
+remote_tcp_port = 443
+remote_udp_port = 443
+
+# Pool
+pool_size = 24
+refill_batch = 8
+connect_timeout = 5
+idle_timeout = 240
+half_close_timeout = 10
+preconnect_ttl_ms = 50000
+splice_chunk = 262144
+
+# UDP
+udp_idle_timeout = 60
+udp_socket_buffer = 4194304
+
+# Listen
+listen_backlog = 16384
+
+# Logging
+log_rate_per_sec = 24
+log_enable = true
+
+# TCP Keepalive
+tcp_keepidle = 360
+tcp_keepintvl = 15
+tcp_keepcnt = 1
+tcp_user_timeout_ms = 0

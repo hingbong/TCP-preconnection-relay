@@ -24,6 +24,9 @@ use sock as s;
 #[derive(Parser)]
 #[command(name = "relay", about = "TCP/UDP preconnection relay (Rust rewrite)")]
 struct Cli {
+    /// Path to TOML config file
+    #[arg(short = 'c', long, env = "RELAY_CONFIG")]
+    config: Option<String>,
     #[arg(short, long, env = "LOCAL_IP")]
     local_ip: Option<String>,
     #[arg(short = 'P', long, env = "LOCAL_PORT")]
@@ -212,22 +215,26 @@ fn udp_hash(addr: &SockAddr) -> usize {
 fn main() {
     let cli = Cli::parse();
 
-    let mut cfg = Config::from_env();
-    if let Some(ip) = cli.local_ip {
-        cfg.local_ip = ip;
-    }
-    if let Some(port) = cli.local_port {
-        cfg.local_port = port;
-    }
-    if let Some(ip) = cli.remote_ip {
-        cfg.remote_ip = ip;
-    }
-    if let Some(port) = cli.remote_tcp_port {
-        cfg.remote_tcp_port = port;
-    }
-    if let Some(port) = cli.remote_udp_port {
-        cfg.remote_udp_port = port;
-    }
+    // ── Config: file → env → CLI ──────────────────────────
+    let mut cfg = if let Some(ref path) = cli.config {
+        Config::from_file(path).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        })
+    } else {
+        Config::default()
+    };
+    cfg.apply_env_overrides();
+    // CLI overrides (highest priority)
+    if let Some(ref ip) = cli.local_ip { cfg.local_ip = ip.clone(); }
+    if let Some(port) = cli.local_port { cfg.local_port = port; }
+    if let Some(ref ip) = cli.remote_ip { cfg.remote_ip = ip.clone(); }
+    if let Some(port) = cli.remote_tcp_port { cfg.remote_tcp_port = port; }
+    if let Some(port) = cli.remote_udp_port { cfg.remote_udp_port = port; }
+    let cfg = cfg.validate().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
 
     log::push(format!(
         "Using config: {}:{} -> TCP:{}/UDP:{}",

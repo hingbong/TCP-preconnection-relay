@@ -10,6 +10,8 @@ mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
 socket2 = "0.5"
 libc = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [profile.release]
 opt-level = 3

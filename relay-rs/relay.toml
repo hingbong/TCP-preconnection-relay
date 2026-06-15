@@ -1,37 +1,79 @@
-# relay.toml — sample config (all values optional, defaults shown)
+# relay.toml — TCP/UDP preconnection relay configuration
 #
-# Usage: relay -c relay.toml
-# Env vars and CLI args override these values.
+# Usage:  relay -c relay.toml
+# Merge:  CLI args > env vars > this file > built-in defaults
+#
+# All keys except the five under [Required] are optional.
+# Omitted keys keep their default values.
+# Every key has a corresponding UPPER_SNAKE_CASE environment variable.
 
-# Required
-local_ip = "0.0.0.0"
-local_port = 1234
-remote_ip = "1.2.3.4"
-remote_tcp_port = 443
-remote_udp_port = 443
+# ── Required ──────────────────────────────────────────────────────
+#
+# Bind address and listen port.
+local_ip          = "0.0.0.0"
+local_port        = 1234
 
-# Pool
-pool_size = 24
-refill_batch = 8
-connect_timeout = 5
-idle_timeout = 240
+# Upstream target host and ports.
+remote_ip         = "1.2.3.4"
+remote_tcp_port   = 443
+remote_udp_port   = 443
+
+# ── Pool ──────────────────────────────────────────────────────────
+#
+# Maximum number of preconnected sockets to keep.
+# Set to 0 to disable the pool (every client gets a direct connect).
+pool_size         = 24
+
+# How many connections to open per refill round.
+refill_batch      = 8
+
+# Seconds to wait for a connect(2) call to complete.
+connect_timeout   = 5
+
+# Seconds of inactivity before closing a relayed connection.
+idle_timeout      = 240
+
+# Seconds to wait after one side sends EOF before tearing down.
 half_close_timeout = 10
-preconnect_ttl_ms = 50000
-splice_chunk = 262144
 
-# UDP
-udp_idle_timeout = 60
+# Milliseconds — pool sockets older than this are rotated (anti-QoS).
+preconnect_ttl_ms = 50000
+
+# Bytes — maximum data buffered in the splice pipe at any time.
+splice_chunk      = 262144
+
+# ── UDP ───────────────────────────────────────────────────────────
+#
+# Seconds before dropping an idle UDP association.
+udp_idle_timeout  = 60
+
+# Bytes — SO_RCVBUF / SO_SNDBUF applied to UDP sockets.
 udp_socket_buffer = 4194304
 
-# Listen
-listen_backlog = 16384
+# ── Listen ────────────────────────────────────────────────────────
+#
+# Kernel accept-queue depth passed to listen(2).
+listen_backlog    = 16384
 
-# Logging
-log_rate_per_sec = 24
-log_enable = true
+# ── Logging ───────────────────────────────────────────────────────
+#
+# Maximum log lines emitted per second. 0 suppresses all output.
+log_rate_per_sec  = 24
 
-# TCP Keepalive
-tcp_keepidle = 360
-tcp_keepintvl = 15
-tcp_keepcnt = 1
+# Set to false to disable logging entirely.
+log_enable        = true
+
+# ── TCP Keepalive ─────────────────────────────────────────────────
+#
+# Seconds of idle time before the kernel starts sending keepalive probes.
+tcp_keepidle      = 360
+
+# Seconds between successive keepalive probes.
+tcp_keepintvl     = 15
+
+# Number of failed probes before the connection is marked dead.
+tcp_keepcnt       = 1
+
+# Milliseconds — TCP_USER_TIMEOUT.
+# 0 means use the system default (typically ~13 minutes).
 tcp_user_timeout_ms = 0

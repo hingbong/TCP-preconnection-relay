@@ -278,7 +278,7 @@ fn main() {
     // Preconnection pool
     let pool = Arc::new(Mutex::new(Pool::new(cfg.pool_size)));
     if cfg.pool_size > 0 {
-        let cfg_arc = Arc::new(Config::from_env());
+        let cfg_arc = Arc::new(cfg.clone());
         pool::spawn_maintain_thread(cfg_arc, Arc::clone(&pool), remote_tcp_addr.clone());
     }
 

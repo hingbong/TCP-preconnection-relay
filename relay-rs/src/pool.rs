@@ -1,28 +1,34 @@
-use std::os::fd::{IntoRawFd, RawFd};
+use std::os::fd::{BorrowedFd, RawFd};
+use std::os::unix::io::IntoRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::sys::socket::{
+    connect, getsockopt, sockopt::SocketError,
+    SockaddrLike, SockaddrStorage,
+};
+
 use crate::config::Config;
 use crate::log;
 use crate::sock;
 
-/// A preconnected socket in the pool, with its birth time.
+fn bfd(fd: RawFd) -> BorrowedFd<'static> {
+    unsafe { BorrowedFd::borrow_raw(fd) }
+}
+
 struct PoolEntry {
     fd: RawFd,
     birth: Instant,
 }
 
-/// The shared connection pool, protected by a Mutex (same as C's pool_mtx).
 pub struct Pool {
     entries: Vec<PoolEntry>,
     pub max_size: usize,
-    /// Number of in-flight connect attempts.
     pub pending: AtomicUsize,
-    /// Consecutive failed connect attempts; triggers backoff.
     fail_streak: AtomicUsize,
-    /// When to resume refills (monotonic Instant).
     pause_until: Mutex<Option<Instant>>,
 }
 
@@ -37,34 +43,26 @@ impl Pool {
         }
     }
 
-    /// Put a successfully connected fd into the pool.
     pub fn put(&mut self, fd: RawFd, now: Instant) {
         if self.entries.len() < self.max_size {
             self.entries.push(PoolEntry { fd, birth: now });
         } else {
-            unsafe { libc::close(fd) };
+            let _ = nix::unistd::close(fd);
         }
     }
 
-    /// Take a preconnected fd from the pool.
-    /// **FIX for the C bug:** loops until it finds a live fd or the pool is empty.
     pub fn take_live(&mut self) -> Option<RawFd> {
         loop {
             let entry = self.entries.pop()?;
             if sock::socket_dead_fast(entry.fd) {
-                unsafe { libc::close(entry.fd) };
+                let _ = nix::unistd::close(entry.fd);
                 continue;
             }
             return Some(entry.fd);
         }
     }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
-/// Spawn the maintenance thread: sweeps zombies, rotates expired preconnects, refills.
 pub fn spawn_maintain_thread(
     cfg: Arc<Config>,
     pool: Arc<Mutex<Pool>>,
@@ -79,7 +77,7 @@ pub fn spawn_maintain_thread(
             // Sweep zombies
             pool_guard.entries.retain(|entry| {
                 if sock::socket_dead_fast(entry.fd) {
-                    unsafe { libc::close(entry.fd) };
+                    let _ = nix::unistd::close(entry.fd);
                     log::push("Checking: Clear Zombies".into());
                     false
                 } else {
@@ -91,7 +89,7 @@ pub fn spawn_maintain_thread(
             let ttl = Duration::from_millis(cfg.preconnect_ttl_ms);
             pool_guard.entries.retain(|entry| {
                 if now - entry.birth > ttl {
-                    unsafe { libc::close(entry.fd) };
+                    let _ = nix::unistd::close(entry.fd);
                     log::push("Checking: preconnect rotating".into());
                     false
                 } else {
@@ -109,10 +107,10 @@ pub fn spawn_maintain_thread(
                 for _ in 0..want {
                     pool_guard.pending.fetch_add(1, Ordering::Release);
                     let pool2 = Arc::clone(&pool);
-                    let remote_addr2 = remote_addr.clone();
+                    let remote_addr_clone = remote_addr.clone();
                     let cfg2 = Arc::clone(&cfg);
                     thread::spawn(move || {
-                        refill_one(&cfg2, &remote_addr2, &pool2);
+                        refill_one(&cfg2, &remote_addr_clone, &pool2);
                     });
                 }
             }
@@ -125,43 +123,49 @@ fn refill_one(cfg: &Config, remote_addr: &socket2::SockAddr, pool: &Mutex<Pool>)
     match sock::create_tcp_socket(remote_addr.domain(), cfg, None) {
         Ok(sock) => {
             let fd = sock.into_raw_fd();
-            let c_ret = unsafe { libc::connect(fd, remote_addr.as_ptr(), remote_addr.len()) };
-            if c_ret == 0 {
-                connect_success(fd, pool, cfg);
-                return;
-            }
-            let err = unsafe { *libc::__errno_location() };
-            if err != libc::EINPROGRESS {
-                unsafe { libc::close(fd) };
-                connect_fail(pool, cfg);
-                return;
-            }
 
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
+            // Resolve socket2::SockAddr to nix SockaddrStorage for connect()
+            let remote_ptr = remote_addr.as_ptr() as *const libc::sockaddr;
+            let remote_len = remote_addr.len();
+            let nix_addr = unsafe {
+                SockaddrStorage::from_raw(remote_ptr, Some(remote_len))
             };
-            let timeout_ms = (cfg.connect_timeout * 1000) as i32;
-            let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-            if r > 0 {
-                let mut err_val: i32 = 0;
-                let mut len: u32 = std::mem::size_of::<i32>() as u32;
-                let gs_ret = unsafe {
-                    libc::getsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        &mut err_val as *mut _ as *mut libc::c_void,
-                        &mut len,
-                    )
-                };
-                if gs_ret == 0 && err_val == 0 {
+            let nix_addr = match nix_addr {
+                Some(a) => a,
+                None => {
+                    let _ = nix::unistd::close(fd);
+                    connect_fail(pool, cfg);
+                    return;
+                }
+            };
+
+            match connect(fd, &nix_addr) {
+                Ok(()) => {
                     connect_success(fd, pool, cfg);
                     return;
                 }
+                Err(nix::Error::EINPROGRESS) => {
+                    // Wait for completion
+                    let b = bfd(fd);
+                    let mut pfd = [PollFd::new(b, PollFlags::POLLOUT)];
+                    let timeout = PollTimeout::from((cfg.connect_timeout * 1000) as u16);
+                    match poll(&mut pfd, timeout) {
+                        Ok(n) if n > 0 => {
+                            match getsockopt(&bfd(fd), SocketError) {
+                                Ok(0) => {
+                                    connect_success(fd, pool, cfg);
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
-            unsafe { libc::close(fd) };
+
+            let _ = nix::unistd::close(fd);
             connect_fail(pool, cfg);
         }
         Err(_) => {

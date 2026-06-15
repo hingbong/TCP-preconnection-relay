@@ -77,6 +77,8 @@ pub fn resolve(host: &str, port: u16, _socktype: Type) -> std::io::Result<SockAd
 }
 
 /// Fast dead-socket check using poll(2) with zero timeout.
+/// Also detects FIN-only half-close by peeking when POLLIN is set without
+/// error flags (kernel sets POLLIN but not POLLHUP when only a FIN arrived).
 pub fn socket_dead_fast(fd: RawFd) -> bool {
     use std::os::fd::BorrowedFd;
     use nix::poll::{poll, PollFd, PollFlags};
@@ -85,9 +87,24 @@ pub fn socket_dead_fast(fd: RawFd) -> bool {
     match poll(&mut fds, 0u8) {
         Ok(1) => {
             let revents = fds[0].revents().unwrap_or(PollFlags::empty());
-            revents.intersects(
-                PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL,
-            )
+            if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+                return true;
+            }
+            // POLLIN without an error flag can mean FIN was received.
+            // A zero-byte MSG_PEEK recv confirms EOF.
+            if revents.contains(PollFlags::POLLIN) {
+                let mut byte = [0u8; 1];
+                let n = unsafe {
+                    libc::recv(
+                        fd,
+                        byte.as_mut_ptr() as *mut libc::c_void,
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                };
+                return n == 0; // 0 = EOF (FIN received)
+            }
+            false
         }
         _ => false,
     }

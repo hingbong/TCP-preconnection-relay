@@ -55,9 +55,12 @@ struct Cli {
     remote_udp_port: Option<u16>,
 }
 
-const TAG_REMOTE: usize = 1;
 const TOKEN_ACCEPT: Token = Token(usize::MAX);
 const TOKEN_UDP: Token = Token(usize::MAX - 1);
+// UDP upstream sockets use tokens in [UDP_UPSTREAM_BASE, ...), which is
+// well above any realistic TCP slab token (slab_idx*2) and below the
+// special sentinel tokens near usize::MAX.
+const UDP_UPSTREAM_BASE: usize = 1 << 26;
 
 #[derive(Debug, PartialEq)]
 enum PumpStatus {
@@ -164,39 +167,37 @@ fn conn_watch(conn: &Conn, registry: &Registry, slab_idx: usize) {
     if conn.closed {
         return;
     }
-    let token_l = Token(slab_idx);
-    let _ = registry.reregister(
-        &mut SourceFd(&conn.fd_l),
-        token_l,
-        Interest::READABLE | Interest::WRITABLE,
-    );
-    let token_r = Token(slab_idx | TAG_REMOTE);
-    let _ = registry.reregister(
-        &mut SourceFd(&conn.fd_r),
-        token_r,
-        Interest::READABLE | Interest::WRITABLE,
-    );
+    // Token scheme: local = slab_idx*2, remote = slab_idx*2+1.
+    // This avoids the collision that occurred when using slab_idx | 1
+    // (odd indices produced identical local/remote tokens).
+    let token_l = Token(slab_idx * 2);
+    let token_r = Token(slab_idx * 2 + 1);
+
+    // Only register WRITABLE when there is buffered data waiting to be
+    // drained into that socket.  Always registering WRITABLE causes an
+    // edge-triggered epoll busy-loop because EPOLL_CTL_MOD with EPOLLOUT
+    // on a socket that is already writable fires an event immediately.
+    let int_l = if conn.len_r2l > 0 {
+        Interest::READABLE | Interest::WRITABLE
+    } else {
+        Interest::READABLE
+    };
+    let _ = registry.reregister(&mut SourceFd(&conn.fd_l), token_l, int_l);
+
+    let int_r = if conn.len_l2r > 0 {
+        Interest::READABLE | Interest::WRITABLE
+    } else {
+        Interest::READABLE
+    };
+    let _ = registry.reregister(&mut SourceFd(&conn.fd_r), token_r, int_r);
 }
 
-const UDP_TABLE_SIZE: usize = 1024;
-
-#[allow(dead_code)]
 struct UdpAssoc {
     cli_addr: SockAddr,
     up_fd: RawFd,
     last_act: Instant,
+    #[allow(dead_code)] // stored for potential introspection/debugging
     token: Token,
-}
-
-fn udp_hash(addr: &SockAddr) -> usize {
-    let raw = addr.as_ptr() as *const u8;
-    let len = addr.len() as usize;
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(raw, len.min(16)) };
-    let mut h: usize = 0;
-    for &b in bytes {
-        h = h.wrapping_mul(31).wrapping_add(b as usize);
-    }
-    h & (UDP_TABLE_SIZE - 1)
 }
 
 fn main() {
@@ -222,8 +223,8 @@ fn main() {
     });
 
     log::push(format!(
-        "Using config: {}:{} -> TCP:{}/UDP:{}",
-        cfg.remote_ip, cfg.remote_tcp_port, cfg.remote_tcp_port, cfg.remote_udp_port
+        "Using config: local={}:{} -> remote={} TCP:{}/UDP:{}",
+        cfg.local_ip, cfg.local_port, cfg.remote_ip, cfg.remote_tcp_port, cfg.remote_udp_port
     ));
     log::push(format!(
         "Runtime: pool={} refill={} splice={} backlog={} udp_buf={} log={}",
@@ -303,7 +304,8 @@ fn main() {
         free.push_back(idx);
     }
 
-    let mut udp_tab: Vec<Vec<UdpAssoc>> = (0..UDP_TABLE_SIZE).map(|_| Vec::new()).collect();
+    let mut udp_slots: Vec<Option<UdpAssoc>> = Vec::new();
+    let mut udp_free: VecDeque<usize> = VecDeque::new();
     let mut events = Events::with_capacity(1024);
     let mut last_cleanup = Instant::now();
 
@@ -376,7 +378,7 @@ fn main() {
                             );
 
                             let conn = conns[slab_idx].as_ref().unwrap();
-                            let token_l = Token(slab_idx);
+                            let token_l = Token(slab_idx * 2);
                             let mut src_fd_l = SourceFd(&conn.fd_l);
                             if poll.registry().register(&mut src_fd_l, token_l, Interest::READABLE).is_err() {
                                 conns[slab_idx] = None;
@@ -384,7 +386,7 @@ fn main() {
                                 continue;
                             }
 
-                            let token_r = Token(slab_idx | TAG_REMOTE);
+                            let token_r = Token(slab_idx * 2 + 1);
                             let mut src_fd_r = SourceFd(&conn.fd_r);
                             let interest = if connecting { Interest::WRITABLE } else { Interest::READABLE };
                             if poll.registry().register(&mut src_fd_r, token_r, interest).is_err() {
@@ -440,20 +442,17 @@ fn main() {
                     .map(|(_, addr)| addr)
                     .unwrap();
 
-                    let h = udp_hash(&cli_sock_addr);
-                    let tab_len = udp_tab.len();
-                    let bucket = &mut udp_tab[h];
-                    let mut found = false;
-                    for assoc in bucket.iter_mut() {
-                        if !sock::sockaddr_eq(&assoc.cli_addr, &cli_sock_addr) {
-                            continue;
-                        }
-                        let _ = send(assoc.up_fd, &buf[..n], MsgFlags::MSG_DONTWAIT);
-                        assoc.last_act = now;
-                        found = true;
-                        break;
-                    }
-                    if !found {
+                    // Find existing upstream for this client; extract up_fd as a
+                    // Copy value so the mutable borrow on udp_slots ends here,
+                    // allowing insertion into udp_slots in the else branch.
+                    let found_up_fd = udp_slots.iter_mut()
+                        .filter_map(|s| s.as_mut())
+                        .find(|a| sock::sockaddr_eq(&a.cli_addr, &cli_sock_addr))
+                        .map(|a| { a.last_act = now; a.up_fd });
+
+                    if let Some(up_fd) = found_up_fd {
+                        let _ = send(up_fd, &buf[..n], MsgFlags::MSG_DONTWAIT);
+                    } else {
                         match sock::create_udp_socket(domain, &cfg) {
                             Ok(s) => {
                                 let up_fd = s.into_raw_fd();
@@ -464,17 +463,25 @@ fn main() {
                                         remote_udp_addr.len(),
                                     );
                                 }
-                                let token_val = (usize::MAX - 3).saturating_sub(tab_len);
-                                let t = Token(token_val);
+                                // Allocate a slot and assign a unique epoll token.
+                                let slot_idx = if let Some(idx) = udp_free.pop_front() {
+                                    idx
+                                } else {
+                                    let idx = udp_slots.len();
+                                    udp_slots.push(None);
+                                    idx
+                                };
+                                let t = Token(UDP_UPSTREAM_BASE + slot_idx);
                                 if poll.registry()
                                     .register(&mut SourceFd(&up_fd), t, Interest::READABLE)
                                     .is_err()
                                 {
                                     let _ = nix::unistd::close(up_fd);
+                                    udp_free.push_back(slot_idx);
                                     continue;
                                 }
                                 let _ = send(up_fd, &buf[..n], MsgFlags::MSG_DONTWAIT);
-                                bucket.push(UdpAssoc {
+                                udp_slots[slot_idx] = Some(UdpAssoc {
                                     cli_addr: cli_sock_addr,
                                     up_fd,
                                     last_act: now,
@@ -487,14 +494,49 @@ fn main() {
                 }
             }
 
-            // ── TCP connection event ──────────────────────────
+            // ── UDP upstream response / TCP connection event ──
             else {
                 let raw = usize::from(token);
                 if raw >= (usize::MAX - 10) {
                     continue;
                 }
-                let is_remote = (raw & TAG_REMOTE) != 0;
-                let idx = raw & !TAG_REMOTE;
+
+                // ── UDP upstream response ─────────────────────
+                if raw >= UDP_UPSTREAM_BASE {
+                    let slot_idx = raw - UDP_UPSTREAM_BASE;
+                    let mut buf = [0u8; 65535];
+                    if let Some(Some(ref mut assoc)) = udp_slots.get_mut(slot_idx) {
+                        loop {
+                            let n = unsafe {
+                                libc::recv(
+                                    assoc.up_fd,
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    buf.len(),
+                                    libc::MSG_DONTWAIT,
+                                )
+                            };
+                            if n <= 0 { break; }
+                            let n = n as usize;
+                            unsafe {
+                                libc::sendto(
+                                    udp_listen_fd,
+                                    buf.as_ptr() as *const libc::c_void,
+                                    n,
+                                    0,
+                                    assoc.cli_addr.as_ptr() as *const libc::sockaddr,
+                                    assoc.cli_addr.len(),
+                                );
+                            }
+                            assoc.last_act = now;
+                        }
+                    }
+                    continue;
+                }
+
+                // ── TCP connection event ──────────────────────
+                // Decode token: local = slab_idx*2, remote = slab_idx*2+1
+                let is_remote = (raw & 1) != 0;
+                let idx = raw >> 1;
                 if idx >= conns.len() {
                     continue;
                 }
@@ -690,16 +732,16 @@ fn main() {
                 i += 1;
             }
 
-            for bucket in udp_tab.iter_mut() {
-                bucket.retain(|assoc| {
+            for (slot_idx, slot) in udp_slots.iter_mut().enumerate() {
+                if let Some(ref assoc) = *slot {
                     if now - assoc.last_act > Duration::from_secs(cfg.udp_idle_timeout) {
-                        let _ = poll.registry().deregister(&mut SourceFd(&assoc.up_fd));
-                        let _ = nix::unistd::close(assoc.up_fd);
-                        false
-                    } else {
-                        true
+                        let up_fd = assoc.up_fd;
+                        let _ = poll.registry().deregister(&mut SourceFd(&up_fd));
+                        let _ = nix::unistd::close(up_fd);
+                        *slot = None;
+                        udp_free.push_back(slot_idx);
                     }
-                });
+                }
             }
         }
     }

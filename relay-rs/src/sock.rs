@@ -62,6 +62,14 @@ pub fn set_tcp_options(sock: &Socket, cfg: &Config) {
                 std::mem::size_of::<c_int>() as socklen_t,
             );
         }
+        // TCP_QUICKACK — disable delayed ACK for low-latency forwarding
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<c_int>() as socklen_t,
+        );
     }
 }
 
@@ -123,6 +131,26 @@ pub fn socket_dead_fast(fd: std::os::fd::RawFd) -> bool {
         return false;
     }
     (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+}
+
+/// Compare two sockaddr values for equality (ip + port), handling v4 and v6.
+pub fn sockaddr_eq(a: &SockAddr, b: &SockAddr) -> bool {
+    let a_raw = a.as_ptr();
+    let b_raw = b.as_ptr();
+    let a_len = a.len();
+    let b_len = b.len();
+
+    if a_len != b_len {
+        return false;
+    }
+    // memcmp the raw bytes
+    unsafe {
+        libc::memcmp(
+            a_raw as *const libc::c_void,
+            b_raw as *const libc::c_void,
+            a_len as usize,
+        ) == 0
+    }
 }
 
 /// Shutdown write half of a socket (send EOF).

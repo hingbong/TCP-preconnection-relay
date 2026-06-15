@@ -250,6 +250,16 @@ fn main() {
         if cfg.log_enable { "on" } else { "off" }
     ));
 
+    // Raise fd limit and ignore SIGPIPE (parity with C version)
+    unsafe {
+        let rlim = libc::rlimit {
+            rlim_cur: 65535,
+            rlim_max: 65535,
+        };
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     let local_addr = sock::resolve(&cfg.local_ip, cfg.local_port, Type::STREAM)
         .expect("failed to resolve LOCAL_IP");
     let remote_tcp_addr =
@@ -264,6 +274,7 @@ fn main() {
     // TCP listen
     let tcp_listen = Socket::new(domain, Type::STREAM, Some(socket2::Protocol::TCP)).unwrap();
     tcp_listen.set_nonblocking(true).unwrap();
+    tcp_listen.set_reuse_address(true).unwrap();
     tcp_listen.bind(&local_addr).unwrap();
     tcp_listen.listen(cfg.listen_backlog).unwrap();
     let tcp_listen_fd = tcp_listen.into_raw_fd();
@@ -271,6 +282,7 @@ fn main() {
     // UDP listen
     let udp_listen = Socket::new(domain, Type::DGRAM, Some(socket2::Protocol::UDP)).unwrap();
     udp_listen.set_nonblocking(true).unwrap();
+    udp_listen.set_reuse_address(true).unwrap();
     let _ = udp_listen.set_recv_buffer_size(cfg.udp_socket_buffer);
     let _ = udp_listen.set_send_buffer_size(cfg.udp_socket_buffer);
     udp_listen.bind(&local_addr).unwrap();
@@ -361,7 +373,9 @@ fn main() {
                             let (pipe_l2r_r, pipe_l2r_w) = make_pipe().unwrap();
                             let (pipe_r2l_r, pipe_r2l_w) = make_pipe().unwrap();
                             tune_pipe(pipe_l2r_r);
+                            tune_pipe(pipe_l2r_w);
                             tune_pipe(pipe_r2l_r);
+                            tune_pipe(pipe_r2l_w);
 
                             // Allocate slab slot
                             let slab_idx = alloc_slot(
@@ -476,6 +490,9 @@ fn main() {
                     let bucket = &mut udp_tab[h];
                     let mut found = false;
                     for assoc in bucket.iter_mut() {
+                        if !sock::sockaddr_eq(&assoc.cli_addr, &cli_sock_addr) {
+                            continue;
+                        }
                         let _ = unsafe {
                             libc::sendto(
                                 assoc.up_fd,
@@ -494,6 +511,14 @@ fn main() {
                         match sock::create_udp_socket(domain, &cfg) {
                             Ok(s) => {
                                 let up_fd = s.into_raw_fd();
+                                // connect() the upstream UDP socket so send() can be used
+                                unsafe {
+                                    libc::connect(
+                                        up_fd,
+                                        remote_udp_addr.as_ptr(),
+                                        remote_udp_addr.len(),
+                                    );
+                                }
                                 let token_val =
                                     (usize::MAX - 3).saturating_sub(tab_len);
                                 let t = Token(token_val);

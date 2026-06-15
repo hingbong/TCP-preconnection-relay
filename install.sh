@@ -19,20 +19,22 @@ err()   { echo -e "${RED}[!]${NC} $*"; exit 1; }
 
 # ── Detect CPU level ──────────────────────────────────────────
 detect_cpu_level() {
-    local flags
-    flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)
-    if [[ -z "$flags" ]]; then
-        warn "cannot read /proc/cpuinfo, defaulting to amd64-v2"
+    local ld_path="/lib64/ld-linux-x86-64.so.2"
+    
+    # Check if the dynamic linker exists at the standard path
+    if [[ ! -x "$ld_path" ]]; then
+        # Fallback if ld-linux isn't found or accessible
         echo "amd64-v2"
         return
     fi
-    for f in avx2 bmi1 bmi2 f16c fma lzcnt movbe; do
-        if ! grep -qw "$f" <<< "$flags"; then
-            echo "amd64-v2"
-            return
-        fi
-    done
-    echo "amd64-v3"
+
+    # Query ld-linux for supported microarchitectures. 
+    # If 'x86-64-v3 (supported' is found, we return v3.
+    if "$ld_path" --help 2>/dev/null | grep -q "x86-64-v3 (supported"; then
+        echo "amd64-v3"
+    else
+        echo "amd64-v2"
+    fi
 }
 
 CPU_LEVEL="${RELAY_CPU:-$(detect_cpu_level)}"

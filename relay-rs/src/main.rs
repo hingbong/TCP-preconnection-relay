@@ -127,7 +127,7 @@ fn pump(
                 }
                 Err(Errno::EAGAIN) => break,
                 Err(_) => return PumpStatus::Err,
-                Ok(_) => {}
+                Ok(_) => break, // splice returned 0 yet pipe still has data — shouldn't happen, but break to avoid infinite loop
             }
         }
 

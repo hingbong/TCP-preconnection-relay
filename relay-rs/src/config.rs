@@ -214,8 +214,8 @@ impl Config {
         if !(16 * 1024..=1024 * 1024).contains(&self.splice_chunk) {
             return Err("splice_chunk must be between 16 KiB and 1 MiB".into());
         }
-        if self.preconnect_ttl_ms < 10_000 {
-            return Err("preconnect_ttl_ms must be >= 10000".into());
+        if self.connect_timeout < 1 || self.connect_timeout > 65 {
+            return Err("connect_timeout must be between 1 and 65 seconds".into());
         }
         Ok(self)
     }

@@ -96,19 +96,29 @@ pub fn take_live_unlocked(pool_mutex: &Mutex<Pool>) -> Option<OwnedFd> {
         // Step 2: check liveness WITHOUT holding the lock.
         let mut live_unused: Vec<PoolEntry> = Vec::new();
         let mut result: Option<OwnedFd> = None;
+        let now = Instant::now();
 
         for entry in candidates {
             if result.is_some() {
                 live_unused.push(entry);
-            } else if !sock::socket_dead_fast(entry.fd.as_raw_fd()) {
+            } else if !sock::socket_dead_fast(entry.fd.as_raw_fd())
+                && now.duration_since(entry.birth).as_millis() as u64 <= entry.ttl_ms
+            {
                 result = Some(entry.fd);
             }
-            // Dead entries: OwnedFd drops here → fd closed automatically.
+            // Dead or expired entries: OwnedFd drops here → fd closed automatically.
         }
 
         // Step 3: return unused live entries under lock.
+        // Guard against the pool being refilled while we were unlocked.
         if !live_unused.is_empty() {
-            pool_mutex.lock().unwrap().entries.extend(live_unused);
+            let mut p = pool_mutex.lock().unwrap();
+            let cap = p.max_size.saturating_sub(p.entries.len());
+            if cap > 0 {
+                p.entries.extend(live_unused.into_iter().take(cap));
+            }
+            // Any surplus beyond capacity are silently dropped; OwnedFd drops
+            // → fd closed automatically.
         }
 
         if result.is_some() {
@@ -178,6 +188,10 @@ pub fn spawn_maintain_thread(
 
             // Re-insert survivors from the lock-free sweep.
             if need_sweep {
+                let cap = p.max_size.saturating_sub(p.entries.len());
+                let to_keep = alive.len().min(cap);
+                let _excess = alive.split_off(to_keep);
+                // _excess drops here → OwnedFd drops → fds closed automatically.
                 p.entries.append(&mut alive);
             }
 

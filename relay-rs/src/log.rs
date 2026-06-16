@@ -92,16 +92,6 @@ impl Logger {
         self.dropped += lines_iter.count();
         let _ = out.flush();
     }
-
-    pub fn flush_all(&mut self) {
-        let mut out = io::stdout().lock();
-        let mut to_flush = String::new();
-        std::mem::swap(&mut to_flush, &mut self.buf);
-        for line in to_flush.lines() {
-            let _ = writeln!(out, "{line}");
-        }
-        let _ = out.flush();
-    }
 }
 
 /// Thread-safe wrapper — both the main event loop and pool thread can log.

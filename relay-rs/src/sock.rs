@@ -18,7 +18,8 @@ pub fn set_tcp_options(sock: &Socket, cfg: &Config) {
 
     // TCP_USER_TIMEOUT — socket2 safe API
     if cfg.tcp_user_timeout_ms > 0 {
-        let _ = sock.set_tcp_user_timeout(Some(Duration::from_millis(cfg.tcp_user_timeout_ms as u64)));
+        let _ =
+            sock.set_tcp_user_timeout(Some(Duration::from_millis(cfg.tcp_user_timeout_ms as u64)));
     }
 
     // TCP_QUICKACK — only available via raw setsockopt
@@ -70,9 +71,9 @@ pub fn resolve(host: &str, port: u16, _socktype: Type) -> std::io::Result<SockAd
         return Ok(SockAddr::from(addr));
     }
     let mut addrs = addr_str.to_socket_addrs()?;
-    let addr = addrs
-        .next()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses resolved"))?;
+    let addr = addrs.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses resolved")
+    })?;
     Ok(SockAddr::from(addr))
 }
 
@@ -80,8 +81,8 @@ pub fn resolve(host: &str, port: u16, _socktype: Type) -> std::io::Result<SockAd
 /// Also detects FIN-only half-close by peeking when POLLIN is set without
 /// error flags (kernel sets POLLIN but not POLLHUP when only a FIN arrived).
 pub fn socket_dead_fast(fd: RawFd) -> bool {
-    use std::os::fd::BorrowedFd;
     use nix::poll::{poll, PollFd, PollFlags};
+    use std::os::fd::BorrowedFd;
     let b = unsafe { BorrowedFd::borrow_raw(fd) };
     let mut fds = [PollFd::new(b, PollFlags::POLLIN)];
     match poll(&mut fds, 0u8) {

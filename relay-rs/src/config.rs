@@ -66,22 +66,54 @@ pub struct Config {
 }
 
 // ── Serde default functions ────────────────────────────────────
-fn default_pool_size() -> usize { 24 }
-fn default_refill_batch() -> usize { 8 }
-fn default_connect_timeout() -> u64 { 5 }
-fn default_idle_timeout() -> u64 { 240 }
-fn default_half_close_timeout() -> u64 { 10 }
-fn default_preconnect_ttl_ms() -> u64 { 50_000 }
-fn default_splice_chunk() -> usize { 262_144 }
-fn default_udp_idle_timeout() -> u64 { 60 }
-fn default_udp_socket_buffer() -> usize { 4_194_304 }
-fn default_listen_backlog() -> i32 { 16_384 }
-fn default_log_rate_per_sec() -> usize { 24 }
-fn default_log_enable() -> bool { true }
-fn default_tcp_keepidle() -> i32 { 360 }
-fn default_tcp_keepintvl() -> i32 { 15 }
-fn default_tcp_keepcnt() -> i32 { 1 }
-fn default_tcp_user_timeout_ms() -> i32 { 0 }
+fn default_pool_size() -> usize {
+    24
+}
+fn default_refill_batch() -> usize {
+    2
+}
+fn default_connect_timeout() -> u64 {
+    5
+}
+fn default_idle_timeout() -> u64 {
+    240
+}
+fn default_half_close_timeout() -> u64 {
+    10
+}
+fn default_preconnect_ttl_ms() -> u64 {
+    300_000
+}
+fn default_splice_chunk() -> usize {
+    65_536
+}
+fn default_udp_idle_timeout() -> u64 {
+    60
+}
+fn default_udp_socket_buffer() -> usize {
+    4_194_304
+}
+fn default_listen_backlog() -> i32 {
+    16_384
+}
+fn default_log_rate_per_sec() -> usize {
+    24
+}
+fn default_log_enable() -> bool {
+    true
+}
+fn default_tcp_keepidle() -> i32 {
+    360
+}
+fn default_tcp_keepintvl() -> i32 {
+    15
+}
+fn default_tcp_keepcnt() -> i32 {
+    1
+}
+fn default_tcp_user_timeout_ms() -> i32 {
+    0
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -116,8 +148,7 @@ impl Config {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, String> {
         let content = fs::read_to_string(path.as_ref())
             .map_err(|e| format!("cannot read config file {:?}: {e}", path.as_ref()))?;
-        toml::from_str(&content)
-            .map_err(|e| format!("invalid TOML in {:?}: {e}", path.as_ref()))
+        toml::from_str(&content).map_err(|e| format!("invalid TOML in {:?}: {e}", path.as_ref()))
     }
 
     /// Override fields from environment variables (UPPER_SNAKE_CASE).
@@ -148,17 +179,8 @@ impl Config {
         apply_env_i32("TCP_USER_TIMEOUT_MS", &mut self.tcp_user_timeout_ms);
     }
 
-    /// Backward-compatible constructor: all defaults + env overrides.
-    /// Panics if LOCAL_IP or LOCAL_PORT or REMOTE_* are missing.
-    pub fn from_env() -> Self {
-        let mut cfg = Self::default();
-        cfg.apply_env_overrides();
-        cfg.validate()
-            .expect("missing required environment variables (LOCAL_IP, LOCAL_PORT, REMOTE_IP, REMOTE_TCP_PORT, REMOTE_UDP_PORT)")
-    }
-
     /// Validate required fields after merge.
-    pub fn validate(self) -> Result<Self, String> {
+    pub fn validate(mut self) -> Result<Self, String> {
         if self.local_ip.is_empty() {
             return Err("local_ip is required (set LOCAL_IP env or local_ip in TOML)".into());
         }
@@ -169,10 +191,31 @@ impl Config {
             return Err("remote_ip is required (set REMOTE_IP env or remote_ip in TOML)".into());
         }
         if self.remote_tcp_port == 0 {
-            return Err("remote_tcp_port is required (set REMOTE_TCP_PORT env or remote_tcp_port in TOML)".into());
+            return Err(
+                "remote_tcp_port is required (set REMOTE_TCP_PORT env or remote_tcp_port in TOML)"
+                    .into(),
+            );
         }
         if self.remote_udp_port == 0 {
-            return Err("remote_udp_port is required (set REMOTE_UDP_PORT env or remote_udp_port in TOML)".into());
+            return Err(
+                "remote_udp_port is required (set REMOTE_UDP_PORT env or remote_udp_port in TOML)"
+                    .into(),
+            );
+        }
+        if self.pool_size > 256 {
+            return Err("pool_size must be <= 256".into());
+        }
+        if self.refill_batch == 0 {
+            self.refill_batch = 1;
+        }
+        if self.pool_size > 0 && self.refill_batch > self.pool_size {
+            self.refill_batch = self.pool_size;
+        }
+        if !(16 * 1024..=1024 * 1024).contains(&self.splice_chunk) {
+            return Err("splice_chunk must be between 16 KiB and 1 MiB".into());
+        }
+        if self.preconnect_ttl_ms < 10_000 {
+            return Err("preconnect_ttl_ms must be >= 10000".into());
         }
         Ok(self)
     }

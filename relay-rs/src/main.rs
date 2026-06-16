@@ -21,12 +21,10 @@ use mio::{Events, Interest, Poll, Registry, Token};
 use std::os::fd::BorrowedFd;
 
 use nix::errno::Errno;
-use nix::fcntl::{splice, SpliceFFlags, FcntlArg};
+use nix::fcntl::{splice, FcntlArg, SpliceFFlags};
 use nix::sys::signal::{signal, SigHandler, Signal};
-use nix::sys::socket::{
-    accept4, connect, send, SockFlag, MsgFlags, SockaddrStorage,
-};
 use nix::sys::socket::SockaddrLike;
+use nix::sys::socket::{accept4, connect, send, MsgFlags, SockFlag, SockaddrStorage};
 use nix::unistd::pipe2;
 use socket2::{SockAddr, Socket, Type};
 
@@ -89,6 +87,8 @@ struct Conn {
     connecting: bool,
     connect_start: Instant,
     closed: bool,
+    interest_l: Interest,
+    interest_r: Interest,
 }
 
 impl Conn {
@@ -124,7 +124,12 @@ fn pump(
 ) -> PumpStatus {
     let mut got_eof = false;
     let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
-    let (s, pw, pr, d) = (bfd(src_fd), bfd(pipe_write_fd), bfd(pipe_read_fd), bfd(dst_fd));
+    let (s, pw, pr, d) = (
+        bfd(src_fd),
+        bfd(pipe_write_fd),
+        bfd(pipe_read_fd),
+        bfd(dst_fd),
+    );
 
     while *pipe_len < splice_chunk {
         let remain = splice_chunk - *pipe_len;
@@ -164,33 +169,44 @@ fn pump(
     }
 }
 
-fn conn_watch(conn: &Conn, registry: &Registry, slab_idx: usize) {
+fn conn_watch(conn: &mut Conn, registry: &Registry, slab_idx: usize) {
     if conn.closed {
         return;
     }
     // Token scheme: local = slab_idx*2, remote = slab_idx*2+1.
-    // This avoids the collision that occurred when using slab_idx | 1
-    // (odd indices produced identical local/remote tokens).
+    // Cache the last Interest to avoid unnecessary epoll_ctl(EPOLL_CTL_MOD)
+    // calls on every event. This reduces CPU bursts during reconnects and
+    // small-packet workloads.
     let token_l = Token(slab_idx * 2);
     let token_r = Token(slab_idx * 2 + 1);
 
-    // Only register WRITABLE when there is buffered data waiting to be
-    // drained into that socket.  Always registering WRITABLE causes an
-    // edge-triggered epoll busy-loop because EPOLL_CTL_MOD with EPOLLOUT
-    // on a socket that is already writable fires an event immediately.
     let int_l = if conn.len_r2l > 0 {
         Interest::READABLE | Interest::WRITABLE
     } else {
         Interest::READABLE
     };
-    let _ = registry.reregister(&mut SourceFd(&conn.fd_l), token_l, int_l);
+    if int_l != conn.interest_l {
+        if registry
+            .reregister(&mut SourceFd(&conn.fd_l), token_l, int_l)
+            .is_ok()
+        {
+            conn.interest_l = int_l;
+        }
+    }
 
     let int_r = if conn.len_l2r > 0 {
         Interest::READABLE | Interest::WRITABLE
     } else {
         Interest::READABLE
     };
-    let _ = registry.reregister(&mut SourceFd(&conn.fd_r), token_r, int_r);
+    if int_r != conn.interest_r {
+        if registry
+            .reregister(&mut SourceFd(&conn.fd_r), token_r, int_r)
+            .is_ok()
+        {
+            conn.interest_r = int_r;
+        }
+    }
 }
 
 struct UdpAssoc {
@@ -214,11 +230,21 @@ fn main() {
         Config::default()
     };
     cfg.apply_env_overrides();
-    if let Some(ref ip) = cli.local_ip { cfg.local_ip = ip.clone(); }
-    if let Some(port) = cli.local_port { cfg.local_port = port; }
-    if let Some(ref ip) = cli.remote_ip { cfg.remote_ip = ip.clone(); }
-    if let Some(port) = cli.remote_tcp_port { cfg.remote_tcp_port = port; }
-    if let Some(port) = cli.remote_udp_port { cfg.remote_udp_port = port; }
+    if let Some(ref ip) = cli.local_ip {
+        cfg.local_ip = ip.clone();
+    }
+    if let Some(port) = cli.local_port {
+        cfg.local_port = port;
+    }
+    if let Some(ref ip) = cli.remote_ip {
+        cfg.remote_ip = ip.clone();
+    }
+    if let Some(port) = cli.remote_tcp_port {
+        cfg.remote_tcp_port = port;
+    }
+    if let Some(port) = cli.remote_udp_port {
+        cfg.remote_udp_port = port;
+    }
     let cfg = cfg.validate().unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
@@ -230,25 +256,27 @@ fn main() {
     ));
     log::push(format!(
         "Runtime: pool={} refill={} splice={} backlog={} udp_buf={} log={}",
-        cfg.pool_size, cfg.refill_batch, cfg.splice_chunk,
-        cfg.listen_backlog, cfg.udp_socket_buffer,
+        cfg.pool_size,
+        cfg.refill_batch,
+        cfg.splice_chunk,
+        cfg.listen_backlog,
+        cfg.udp_socket_buffer,
         if cfg.log_enable { "on" } else { "off" }
     ));
 
     // Raise fd limit and ignore SIGPIPE
-    let _ = nix::sys::resource::setrlimit(
-        nix::sys::resource::Resource::RLIMIT_NOFILE, 65535, 65535,
-    );
-    unsafe { signal(Signal::SIGPIPE, SigHandler::SigIgn).unwrap(); }
+    let _ =
+        nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, 65535, 65535);
+    unsafe {
+        signal(Signal::SIGPIPE, SigHandler::SigIgn).unwrap();
+    }
 
     let local_addr = sock::resolve(&cfg.local_ip, cfg.local_port, Type::STREAM)
         .expect("failed to resolve LOCAL_IP");
-    let remote_tcp_addr =
-        sock::resolve(&cfg.remote_ip, cfg.remote_tcp_port, Type::STREAM)
-            .expect("failed to resolve REMOTE_TCP");
-    let remote_udp_addr =
-        sock::resolve(&cfg.remote_ip, cfg.remote_udp_port, Type::DGRAM)
-            .expect("failed to resolve REMOTE_UDP");
+    let remote_tcp_addr = sock::resolve(&cfg.remote_ip, cfg.remote_tcp_port, Type::STREAM)
+        .expect("failed to resolve REMOTE_TCP");
+    let remote_udp_addr = sock::resolve(&cfg.remote_ip, cfg.remote_udp_port, Type::DGRAM)
+        .expect("failed to resolve REMOTE_UDP");
 
     let domain = local_addr.domain();
 
@@ -272,7 +300,11 @@ fn main() {
     // Epoll
     let mut poll = Poll::new().unwrap();
     poll.registry()
-        .register(&mut SourceFd(&tcp_listen_fd), TOKEN_ACCEPT, Interest::READABLE)
+        .register(
+            &mut SourceFd(&tcp_listen_fd),
+            TOKEN_ACCEPT,
+            Interest::READABLE,
+        )
         .unwrap();
     poll.registry()
         .register(&mut SourceFd(&udp_listen_fd), TOKEN_UDP, Interest::READABLE)
@@ -313,7 +345,8 @@ fn main() {
     let mut last_cleanup = Instant::now();
 
     loop {
-        poll.poll(&mut events, Some(Duration::from_millis(100))).unwrap();
+        poll.poll(&mut events, Some(Duration::from_millis(100)))
+            .unwrap();
         let now = Instant::now();
         log::maybe_flush();
 
@@ -341,7 +374,8 @@ fn main() {
                             } else {
                                 log::push("Exceeded Connections Pool, Direct Out...".into());
                                 match direct_connect(&remote_tcp_addr, &cfg) {
-                                    Ok(fd) => (fd, true),
+                                    Ok(ConnectState::Connected(fd)) => (fd, false),
+                                    Ok(ConnectState::Connecting(fd)) => (fd, true),
                                     Err(_) => {
                                         let _ = nix::unistd::close(cli_fd);
                                         continue;
@@ -351,10 +385,10 @@ fn main() {
 
                             let (pipe_l2r_r, pipe_l2r_w) = make_pipe().unwrap();
                             let (pipe_r2l_r, pipe_r2l_w) = make_pipe().unwrap();
-                            tune_pipe(pipe_l2r_r.as_raw_fd());
-                            tune_pipe(pipe_l2r_w.as_raw_fd());
-                            tune_pipe(pipe_r2l_r.as_raw_fd());
-                            tune_pipe(pipe_r2l_w.as_raw_fd());
+                            tune_pipe(pipe_l2r_r.as_raw_fd(), cfg.splice_chunk);
+                            tune_pipe(pipe_l2r_w.as_raw_fd(), cfg.splice_chunk);
+                            tune_pipe(pipe_r2l_r.as_raw_fd(), cfg.splice_chunk);
+                            tune_pipe(pipe_r2l_w.as_raw_fd(), cfg.splice_chunk);
 
                             let slab_idx = alloc_slot(
                                 &mut conns,
@@ -378,13 +412,23 @@ fn main() {
                                     connecting,
                                     connect_start: now,
                                     closed: false,
+                                    interest_l: Interest::READABLE,
+                                    interest_r: if connecting {
+                                        Interest::WRITABLE
+                                    } else {
+                                        Interest::READABLE
+                                    },
                                 },
                             );
 
                             let conn = conns[slab_idx].as_ref().unwrap();
                             let token_l = Token(slab_idx * 2);
                             let mut src_fd_l = SourceFd(&conn.fd_l);
-                            if poll.registry().register(&mut src_fd_l, token_l, Interest::READABLE).is_err() {
+                            if poll
+                                .registry()
+                                .register(&mut src_fd_l, token_l, Interest::READABLE)
+                                .is_err()
+                            {
                                 conns[slab_idx] = None;
                                 free_slot(&mut conns, &mut free_slots, slab_idx);
                                 continue;
@@ -392,8 +436,16 @@ fn main() {
 
                             let token_r = Token(slab_idx * 2 + 1);
                             let mut src_fd_r = SourceFd(&conn.fd_r);
-                            let interest = if connecting { Interest::WRITABLE } else { Interest::READABLE };
-                            if poll.registry().register(&mut src_fd_r, token_r, interest).is_err() {
+                            let interest = if connecting {
+                                Interest::WRITABLE
+                            } else {
+                                Interest::READABLE
+                            };
+                            if poll
+                                .registry()
+                                .register(&mut src_fd_r, token_r, interest)
+                                .is_err()
+                            {
                                 let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
                                 conns[slab_idx] = None;
                                 free_slot(&mut conns, &mut free_slots, slab_idx);
@@ -405,7 +457,6 @@ fn main() {
                     }
                 }
             }
-
             // ── UDP listen ────────────────────────────────────
             else if token == TOKEN_UDP {
                 let mut buf = [0u8; 65535];
@@ -425,15 +476,17 @@ fn main() {
                     };
                     if n < 0 {
                         let err = unsafe { *libc::__errno_location() };
-                        if err == libc::EAGAIN { break; }
+                        if err == libc::EAGAIN {
+                            break;
+                        }
                         break;
                     }
                     let n = n as usize;
 
                     let cli_sock_addr = unsafe {
                         SockAddr::try_init(|storage, len| {
-                            let ptr = &cli_addr as *const libc::sockaddr_storage
-                                as *const libc::sockaddr;
+                            let ptr =
+                                &cli_addr as *const libc::sockaddr_storage as *const libc::sockaddr;
                             std::ptr::copy_nonoverlapping(
                                 ptr as *const u8,
                                 storage as *mut u8,
@@ -450,18 +503,26 @@ fn main() {
                     let cli_net = cli_sock_addr.as_socket();
                     let found_up_fd = if let Some(net_addr) = cli_net {
                         if let Some(&slot_idx) = udp_map.get(&net_addr) {
-                            udp_slots.get_mut(slot_idx)
+                            udp_slots
+                                .get_mut(slot_idx)
                                 .and_then(|s| s.as_mut())
-                                .map(|a| { a.last_act = now; a.up_fd })
+                                .map(|a| {
+                                    a.last_act = now;
+                                    a.up_fd
+                                })
                         } else {
                             None
                         }
                     } else {
                         // Non-IP address family: fall back to linear scan.
-                        udp_slots.iter_mut()
+                        udp_slots
+                            .iter_mut()
                             .filter_map(|s| s.as_mut())
                             .find(|a| sock::sockaddr_eq(&a.cli_addr, &cli_sock_addr))
-                            .map(|a| { a.last_act = now; a.up_fd })
+                            .map(|a| {
+                                a.last_act = now;
+                                a.up_fd
+                            })
                     };
 
                     if let Some(up_fd) = found_up_fd {
@@ -486,7 +547,8 @@ fn main() {
                                     idx
                                 };
                                 let t = Token(UDP_UPSTREAM_BASE + slot_idx);
-                                if poll.registry()
+                                if poll
+                                    .registry()
                                     .register(&mut SourceFd(&up_fd), t, Interest::READABLE)
                                     .is_err()
                                 {
@@ -498,9 +560,8 @@ fn main() {
                                 if let Some(net_addr) = cli_net {
                                     udp_map.insert(net_addr, slot_idx);
                                 }
-                                let cli_net_addr = cli_net.unwrap_or(
-                                    std::net::SocketAddr::from(([0u8, 0, 0, 0], 0))
-                                );
+                                let cli_net_addr = cli_net
+                                    .unwrap_or(std::net::SocketAddr::from(([0u8, 0, 0, 0], 0)));
                                 udp_slots[slot_idx] = Some(UdpAssoc {
                                     cli_addr: cli_sock_addr,
                                     cli_net_addr,
@@ -514,7 +575,6 @@ fn main() {
                     }
                 }
             }
-
             // ── UDP upstream response / TCP connection event ──
             else {
                 let raw = usize::from(token);
@@ -536,7 +596,9 @@ fn main() {
                                     libc::MSG_DONTWAIT,
                                 )
                             };
-                            if n <= 0 { break; }
+                            if n <= 0 {
+                                break;
+                            }
                             let n = n as usize;
                             unsafe {
                                 libc::sendto(
@@ -572,7 +634,10 @@ fn main() {
                 // Handle connecting remote
                 if is_remote && conn.connecting {
                     if event.is_writable() || event.is_error() {
-                        let err = nix::sys::socket::getsockopt(&bfd(conn.fd_r), nix::sys::socket::sockopt::SocketError);
+                        let err = nix::sys::socket::getsockopt(
+                            &bfd(conn.fd_r),
+                            nix::sys::socket::sockopt::SocketError,
+                        );
                         if err != Ok(0) {
                             log::push("Connect failed".into());
                             let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
@@ -602,8 +667,14 @@ fn main() {
                 // Pump local → remote
                 if !conn.eof_l2r {
                     let res = pump(
-                        conn.fd_l, conn.fd_r, conn.pipe_l2r, conn.pipe_l2r_read,
-                        &mut conn.len_l2r, splice_chunk, now, &mut conn.last_l2r,
+                        conn.fd_l,
+                        conn.fd_r,
+                        conn.pipe_l2r,
+                        conn.pipe_l2r_read,
+                        &mut conn.len_l2r,
+                        splice_chunk,
+                        now,
+                        &mut conn.last_l2r,
                     );
                     match res {
                         PumpStatus::Err => {
@@ -629,13 +700,23 @@ fn main() {
                     let mut drain_err = false;
                     let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
                     while conn.len_l2r > 0 {
-                        match splice(bfd(conn.pipe_l2r_read), None, bfd(conn.fd_r), None, conn.len_l2r, flags) {
+                        match splice(
+                            bfd(conn.pipe_l2r_read),
+                            None,
+                            bfd(conn.fd_r),
+                            None,
+                            conn.len_l2r,
+                            flags,
+                        ) {
                             Ok(n) if n > 0 => {
                                 conn.len_l2r -= n;
                                 conn.last_l2r = now;
                             }
                             Err(Errno::EAGAIN) => break,
-                            _ => { drain_err = true; break; }
+                            _ => {
+                                drain_err = true;
+                                break;
+                            }
                         }
                     }
                     if drain_err {
@@ -655,8 +736,14 @@ fn main() {
                 // Pump remote → local
                 if !conn.eof_r2l {
                     let res = pump(
-                        conn.fd_r, conn.fd_l, conn.pipe_r2l, conn.pipe_r2l_read,
-                        &mut conn.len_r2l, splice_chunk, now, &mut conn.last_r2l,
+                        conn.fd_r,
+                        conn.fd_l,
+                        conn.pipe_r2l,
+                        conn.pipe_r2l_read,
+                        &mut conn.len_r2l,
+                        splice_chunk,
+                        now,
+                        &mut conn.last_r2l,
                     );
                     match res {
                         PumpStatus::Err => {
@@ -682,13 +769,23 @@ fn main() {
                     let mut drain_err = false;
                     let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
                     while conn.len_r2l > 0 {
-                        match splice(bfd(conn.pipe_r2l_read), None, bfd(conn.fd_l), None, conn.len_r2l, flags) {
+                        match splice(
+                            bfd(conn.pipe_r2l_read),
+                            None,
+                            bfd(conn.fd_l),
+                            None,
+                            conn.len_r2l,
+                            flags,
+                        ) {
                             Ok(n) if n > 0 => {
                                 conn.len_r2l -= n;
                                 conn.last_r2l = now;
                             }
                             Err(Errno::EAGAIN) => break,
-                            _ => { drain_err = true; break; }
+                            _ => {
+                                drain_err = true;
+                                break;
+                            }
                         }
                     }
                     if drain_err {
@@ -725,8 +822,11 @@ fn main() {
             let mut i = 0;
             while i < conns.len() {
                 let should_remove = if let Some(Some(ref conn)) = conns.get(i) {
-                    if conn.closed { true }
-                    else if conn.connecting && now - conn.connect_start > Duration::from_secs(cfg.connect_timeout) {
+                    if conn.closed {
+                        true
+                    } else if conn.connecting
+                        && now - conn.connect_start > Duration::from_secs(cfg.connect_timeout)
+                    {
                         log::push("Connect timeout".into());
                         true
                     } else if !conn.connecting {
@@ -737,12 +837,23 @@ fn main() {
                             true
                         } else if let Some(hs) = conn.half_close_since {
                             if now - hs > Duration::from_secs(cfg.half_close_timeout) {
-                                log::push(format!("Half-close timeout({}s)", cfg.half_close_timeout));
+                                log::push(format!(
+                                    "Half-close timeout({}s)",
+                                    cfg.half_close_timeout
+                                ));
                                 true
-                            } else { false }
-                        } else { false }
-                    } else { false }
-                } else { false };
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
 
                 if should_remove {
                     if let Some(Some(conn)) = conns.get(i) {
@@ -773,17 +884,30 @@ fn main() {
     }
 }
 
-fn direct_connect(addr: &SockAddr, cfg: &Config) -> Result<RawFd, ()> {
+enum ConnectState {
+    Connected(RawFd),
+    Connecting(RawFd),
+}
+
+fn direct_connect(addr: &SockAddr, cfg: &Config) -> Result<ConnectState, ()> {
     let sock = sock::create_tcp_socket(addr.domain(), cfg, None).map_err(|_| ())?;
     let fd = sock.into_raw_fd();
-    let nix_addr = unsafe { SockaddrStorage::from_raw(addr.as_ptr() as *const libc::sockaddr, Some(addr.len())) };
+    let nix_addr = unsafe {
+        SockaddrStorage::from_raw(addr.as_ptr() as *const libc::sockaddr, Some(addr.len()))
+    };
     match nix_addr {
         Some(na) => match connect(fd, &na) {
-            Ok(()) => Ok(fd),
-            Err(Errno::EINPROGRESS) => Ok(fd),
-            Err(_) => { let _ = nix::unistd::close(fd); Err(()) }
+            Ok(()) => Ok(ConnectState::Connected(fd)),
+            Err(Errno::EINPROGRESS) => Ok(ConnectState::Connecting(fd)),
+            Err(_) => {
+                let _ = nix::unistd::close(fd);
+                Err(())
+            }
         },
-        None => { let _ = nix::unistd::close(fd); Err(()) }
+        None => {
+            let _ = nix::unistd::close(fd);
+            Err(())
+        }
     }
 }
 
@@ -793,6 +917,7 @@ fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
 }
 
-fn tune_pipe(fd: RawFd) {
-    let _ = nix::fcntl::fcntl(bfd(fd), FcntlArg::F_SETPIPE_SZ(262144));
+fn tune_pipe(fd: RawFd, splice_chunk: usize) {
+    let size = splice_chunk.clamp(16 * 1024, 256 * 1024) as i32;
+    let _ = nix::fcntl::fcntl(bfd(fd), FcntlArg::F_SETPIPE_SZ(size));
 }

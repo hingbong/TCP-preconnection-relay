@@ -217,6 +217,24 @@ impl Config {
         if self.connect_timeout < 1 || self.connect_timeout > 65 {
             return Err("connect_timeout must be between 1 and 65 seconds".into());
         }
+        if self.idle_timeout < 30 {
+            return Err("idle_timeout must be >= 30".into());
+        }
+        if self.half_close_timeout < 1 {
+            return Err("half_close_timeout must be >= 1".into());
+        }
+        if self.preconnect_ttl_ms < 10_000 {
+            return Err("preconnect_ttl_ms must be >= 10000".into());
+        }
+        if self.tcp_keepidle < 10 || self.tcp_keepidle > 86_400 {
+            return Err("tcp_keepidle must be between 10 and 86400".into());
+        }
+        if self.tcp_keepintvl < 1 || self.tcp_keepintvl > 3_600 {
+            return Err("tcp_keepintvl must be between 1 and 3600".into());
+        }
+        if self.tcp_keepcnt < 1 || self.tcp_keepcnt > 30 {
+            return Err("tcp_keepcnt must be between 1 and 30".into());
+        }
         Ok(self)
     }
 }

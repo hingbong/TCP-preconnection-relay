@@ -237,9 +237,13 @@ fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize, splice_chunk: usi
     // Always MOD — this is the ET re-arm. Cost: ~2 syscalls (~400 ns) per
     // connection event, completely negligible compared to data throughput.
     let mut ev_l = EpollEvent::new(want_l, token_l);
-    let _ = epoll.modify(&conn.fd_l, &mut ev_l);
+    if let Err(e) = epoll.modify(&conn.fd_l, &mut ev_l) {
+        log_fmt!("epoll.modify(fd_l) error: {e}");
+    }
     let mut ev_r = EpollEvent::new(want_r, token_r);
-    let _ = epoll.modify(&conn.fd_r, &mut ev_r);
+    if let Err(e) = epoll.modify(&conn.fd_r, &mut ev_r) {
+        log_fmt!("epoll.modify(fd_r) error: {e}");
+    }
 }
 
 // ── UDP association ──────────────────────────────────────────────────────────
@@ -415,7 +419,7 @@ fn main() {
         };
 
         if SHUTDOWN.load(Ordering::SeqCst) {
-            log::push("Shutdown signal received, exiting...".into());
+            log::push("Shutdown signal received, exiting...");
             break;
         }
 
@@ -447,7 +451,7 @@ fn main() {
                             let (rem_owned, connecting) = if let Some(owned) = pool_fd {
                                 (owned, false)
                             } else {
-                                log::push("Exceeded Connections Pool, Direct Out...".into());
+                                log::push("Exceeded Connections Pool, Direct Out...");
                                 match direct_connect(&remote_tcp_addr, &cfg) {
                                     Ok(ConnectState::Connected(owned)) => (owned, false),
                                     Ok(ConnectState::Connecting(owned)) => (owned, true),
@@ -553,7 +557,7 @@ fn main() {
                                         conn.connecting = false;
                                         conn_watch(conn, &epoll, slab_idx, splice_chunk);
                                     } else {
-                                        log::push("Connect failed (post-ADD)".into());
+                                        log::push("Connect failed (post-ADD)");
                                         free_slot(&mut conns, &mut free_slots, slab_idx);
                                     }
                                 }
@@ -654,11 +658,15 @@ fn main() {
             }
 
             // ── UDP upstream response (upstream → us → client) ────────────────
-            // Guard: only consume the event when slot_idx is a valid index
-            // into udp_slots.  Without this guard, TCP connection tokens with
-            // gen >= 1 fall into the [UDP_BASE, TOKEN_UDP) numerical range
-            // (UDP_BASE=1<<26, TCP tokens start at 1<<48) and are silently
-            // dropped by the empty-slot continue on the very next line.
+            // Three-layer defense against TCP token → UDP slot collision:
+            // 1. token >= UDP_BASE: only tokens in [UDP_BASE, TOKEN_UDP) reach
+            //    here.  TCP tokens with gen=0 would need slab index ≥ 33.5M to
+            //    collide — impossible with free-list slab reuse in practice.
+            //    TCP tokens with gen≥1 are ≥ 2^48 and produce slot_idx values
+            //    far beyond udp_slots.len(), caught by layer 2.
+            // 2. slot_idx < udp_slots.len(): out-of-range indices → skipped.
+            // 3. udp_slots[slot_idx].is_some(): freed UDP slots are None → no
+            //    false dispatch.
             if token >= UDP_BASE {
                 let slot_idx = (token - UDP_BASE) as usize;
                 if slot_idx < udp_slots.len() {
@@ -706,7 +714,7 @@ fn main() {
                         nix::sys::socket::sockopt::SocketError,
                     );
                     if err != Ok(0) {
-                        log::push("Connect failed".into());
+                        log::push("Connect failed");
                         free_slot(&mut conns, &mut free_slots, idx);
                         continue;
                     }
@@ -743,7 +751,7 @@ fn main() {
                 );
                 match res {
                     PumpStatus::Err => {
-                        log::push("Connection Error: Local->Remote".into());
+                        log::push("Connection Error: Local->Remote");
                         free_slot(&mut conns, &mut free_slots, idx);
                         continue;
                     }
@@ -754,7 +762,7 @@ fn main() {
                         } else if conn.eof_r2l {
                             conn.half_close_since = None;
                         }
-                        log::push("EOF: Local->Remote".into());
+                        log::push("EOF: Local->Remote");
                     }
                     PumpStatus::Ok => {}
                 }
@@ -807,7 +815,7 @@ fn main() {
                 );
                 match res {
                     PumpStatus::Err => {
-                        log::push("Connection Error: Remote->Local".into());
+                        log::push("Connection Error: Remote->Local");
                         free_slot(&mut conns, &mut free_slots, idx);
                         continue;
                     }
@@ -818,7 +826,7 @@ fn main() {
                         } else if conn.eof_l2r {
                             conn.half_close_since = None;
                         }
-                        log::push("EOF: Remote->Local".into());
+                        log::push("EOF: Remote->Local");
                     }
                     PumpStatus::Ok => {}
                 }
@@ -854,10 +862,15 @@ fn main() {
             if conn.eof_r2l && conn.len_r2l == 0 && !conn.shut_wr_l {
                 s::shutdown_write(conn.fd_l.as_raw_fd());
                 conn.shut_wr_l = true;
+                // conn_watch below will NOT re-arm EPOLLOUT on fd_l because
+                // shut_wr_l is only set when eof_r2l && len_r2l == 0, so the
+                // guard `conn.len_r2l > 0` in conn_watch is also false.  If
+                // another code path ever sets shut_wr_l without draining len_r2l
+                // first, EPOLLOUT would re-arm on a shut-down fd and busy-loop.
             }
 
             if conn.eof_l2r && conn.eof_r2l && conn.len_l2r == 0 && conn.len_r2l == 0 {
-                log::push("Connection Fully Closed".into());
+                log::push("Connection Fully Closed");
                 free_slot(&mut conns, &mut free_slots, idx);
                 continue;
             }
@@ -876,7 +889,7 @@ fn main() {
                         && now.duration_since(conn.connect_start)
                             > Duration::from_secs(cfg.connect_timeout)
                     {
-                        log::push("Connect timeout".into());
+                        log::push("Connect timeout");
                         true
                     } else if !conn.connecting {
                         let last = conn.last_l2r.max(conn.last_r2l);

@@ -53,9 +53,9 @@ pub fn init(enabled: bool, rate: usize) {
 
 /// Push a log line from any thread.  Non-blocking — drops silently when the
 /// bounded queue is full (the next flush will report a "Log dropped" notice).
-pub fn push(msg: String) {
+pub fn push(msg: impl Into<String>) {
     if let Some(tx) = LOG_TX.get() {
-        if tx.try_send(msg).is_err() {
+        if tx.try_send(msg.into()).is_err() {
             SEND_DROPS.fetch_add(1, Ordering::Relaxed);
         }
     }

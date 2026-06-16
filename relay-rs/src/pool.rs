@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,7 +35,10 @@ impl Pool {
             pending: 0,
             fail_streak: 0,
             pause_until: None,
-            rng: 0x517cc1b727220a95,
+            rng: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x517cc1b727220a95),
         }
     }
 
@@ -172,15 +175,15 @@ pub fn spawn_maintain_thread(
             let mut alive: Vec<PoolEntry> = Vec::new();
             if need_sweep {
                 last_sweep = now;
-                // Sweep in fixed-size batches to avoid briefly emptying the
+                // Sweep in proportional batches to avoid briefly emptying the
                 // entire pool (which would cause take_live_unlocked to return
                 // None and trigger an unnecessary direct_connect).
-                const SWEEP_BATCH: usize = 8;
-                let batch = pool.lock().unwrap().pop_batch(SWEEP_BATCH);
+                let sweep_batch = (cfg.pool_size / 4).max(8);
+                let batch = pool.lock().unwrap().pop_batch(sweep_batch);
                 for entry in batch {
                     if sock::socket_dead_fast(entry.fd.as_raw_fd()) {
                         // OwnedFd drops here → fd closed automatically.
-                        log::push("Checking: Clear Zombies".into());
+                        log::push("Checking: Clear Zombies");
                     } else {
                         alive.push(entry);
                     }
@@ -205,7 +208,7 @@ pub fn spawn_maintain_thread(
                 p.entries.retain(|entry| {
                     if now.duration_since(entry.birth).as_millis() as u64 > entry.ttl_ms {
                         // OwnedFd drop will close the fd on retain removal.
-                        log::push("Checking: preconnect rotating".into());
+                        log::push("Checking: preconnect rotating");
                         false
                     } else {
                         true
@@ -241,7 +244,7 @@ fn refill_one(cfg: &Config, remote_addr: &socket2::SockAddr, pool: &Mutex<Pool>)
     // Wrap in OwnedFd immediately so the fd is closed automatically on any
     // early-return error path — no explicit nix::unistd::close() needed (#5).
     let owned = match sock::create_tcp_socket(remote_addr.domain(), cfg, None) {
-        Ok(s) => unsafe { OwnedFd::from_raw_fd(s.into_raw_fd()) },
+        Ok(s) => OwnedFd::from(s),
         Err(_) => {
             connect_fail(pool, cfg);
             return;
@@ -300,7 +303,7 @@ fn connect_success(fd: OwnedFd, pool: &Mutex<Pool>, cfg: &Config) {
             cfg.pool_size,
         ));
     } else {
-        log::push("Preconnected Too Much, Clearing ...".into());
+        log::push("Preconnected Too Much, Clearing ...");
     }
 }
 

@@ -1,5 +1,5 @@
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::io::IntoRawFd;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use crate::log;
 use crate::sock;
 
 struct PoolEntry {
-    fd: RawFd,
+    fd: OwnedFd,
     birth: Instant,
     ttl_ms: u64,
 }
@@ -52,13 +52,13 @@ impl Pool {
         base_ms - quarter + (self.next_rng() % span)
     }
 
-    pub fn put(&mut self, fd: RawFd, now: Instant, base_ttl_ms: u64) -> bool {
+    pub fn put(&mut self, fd: OwnedFd, now: Instant, base_ttl_ms: u64) -> bool {
         if self.entries.len() < self.max_size {
             let ttl_ms = self.jittered_ttl(base_ttl_ms);
             self.entries.push(PoolEntry { fd, birth: now, ttl_ms });
             true
         } else {
-            let _ = nix::unistd::close(fd);
+            // fd drops here → closed automatically.
             false
         }
     }
@@ -82,13 +82,10 @@ impl Pool {
 /// function pops a small batch *under the lock* (no I/O), checks liveness
 /// *outside the lock*, then returns unused live entries *under the lock*.
 /// The mutex is held for two O(1) array operations, never for syscalls.
-pub fn take_live_unlocked(pool_mutex: &Mutex<Pool>) -> Option<RawFd> {
+pub fn take_live_unlocked(pool_mutex: &Mutex<Pool>) -> Option<OwnedFd> {
     const BATCH: usize = 4;
 
     // Keep popping batches until we find a live fd or the pool is empty.
-    // If the first batch's entries are all dead, there may still be live
-    // entries deeper in the pool.  Each iteration does lock-pop (O(1)),
-    // lock-free liveness check, then lock-reinsert of surplus live entries.
     loop {
         // Step 1: pop candidates under lock — no I/O.
         let candidates = pool_mutex.lock().unwrap().pop_batch(BATCH);
@@ -98,16 +95,15 @@ pub fn take_live_unlocked(pool_mutex: &Mutex<Pool>) -> Option<RawFd> {
 
         // Step 2: check liveness WITHOUT holding the lock.
         let mut live_unused: Vec<PoolEntry> = Vec::new();
-        let mut result: Option<RawFd> = None;
+        let mut result: Option<OwnedFd> = None;
 
         for entry in candidates {
             if result.is_some() {
                 live_unused.push(entry);
-            } else if !sock::socket_dead_fast(entry.fd) {
+            } else if !sock::socket_dead_fast(entry.fd.as_raw_fd()) {
                 result = Some(entry.fd);
-            } else {
-                let _ = nix::unistd::close(entry.fd);
             }
+            // Dead entries: OwnedFd drops here → fd closed automatically.
         }
 
         // Step 3: return unused live entries under lock.
@@ -126,6 +122,7 @@ pub fn spawn_maintain_thread(
     cfg: Arc<Config>,
     pool: Arc<Mutex<Pool>>,
     remote_addr: socket2::SockAddr,
+    shutdown: &'static AtomicBool,
 ) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let rx = Arc::new(Mutex::new(rx));
@@ -151,6 +148,9 @@ pub fn spawn_maintain_thread(
 
         loop {
             thread::sleep(Duration::from_millis(100));
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
             let now = Instant::now();
 
             // ── Sweep dead connections (batch-pop + lock-free) ─────────────────
@@ -158,12 +158,14 @@ pub fn spawn_maintain_thread(
             let mut alive: Vec<PoolEntry> = Vec::new();
             if need_sweep {
                 last_sweep = now;
-                // Pop everything, check liveness outside the lock to avoid
-                // holding the mutex during syscalls in socket_dead_fast().
-                let batch = pool.lock().unwrap().pop_batch(usize::MAX);
+                // Sweep in fixed-size batches to avoid briefly emptying the
+                // entire pool (which would cause take_live_unlocked to return
+                // None and trigger an unnecessary direct_connect).
+                const SWEEP_BATCH: usize = 8;
+                let batch = pool.lock().unwrap().pop_batch(SWEEP_BATCH);
                 for entry in batch {
-                    if sock::socket_dead_fast(entry.fd) {
-                        let _ = nix::unistd::close(entry.fd);
+                    if sock::socket_dead_fast(entry.fd.as_raw_fd()) {
+                        // OwnedFd drops here → fd closed automatically.
                         log::push("Checking: Clear Zombies".into());
                     } else {
                         alive.push(entry);
@@ -184,7 +186,7 @@ pub fn spawn_maintain_thread(
                 last_rotate = now;
                 p.entries.retain(|entry| {
                     if now.duration_since(entry.birth).as_millis() as u64 > entry.ttl_ms {
-                        let _ = nix::unistd::close(entry.fd);
+                        // OwnedFd drop will close the fd on retain removal.
                         log::push("Checking: preconnect rotating".into());
                         false
                     } else {
@@ -236,7 +238,7 @@ fn refill_one(cfg: &Config, remote_addr: &socket2::SockAddr, pool: &Mutex<Pool>)
 
     match connect(owned.as_raw_fd(), &nix_addr) {
         Ok(()) => {
-            connect_success(owned.into_raw_fd(), pool, cfg);
+            connect_success(owned, pool, cfg);
             return;
         }
         Err(nix::Error::EINPROGRESS) => {
@@ -248,7 +250,7 @@ fn refill_one(cfg: &Config, remote_addr: &socket2::SockAddr, pool: &Mutex<Pool>)
             if let Ok(n) = poll(&mut pfd, PollTimeout::from(timeout_ms)) {
                 if n > 0 {
                     if let Ok(0) = getsockopt(&owned, SocketError) {
-                        connect_success(owned.into_raw_fd(), pool, cfg);
+                        connect_success(owned, pool, cfg);
                         return;
                     }
                 }
@@ -261,7 +263,7 @@ fn refill_one(cfg: &Config, remote_addr: &socket2::SockAddr, pool: &Mutex<Pool>)
     connect_fail(pool, cfg);
 }
 
-fn connect_success(fd: RawFd, pool: &Mutex<Pool>, cfg: &Config) {
+fn connect_success(fd: OwnedFd, pool: &Mutex<Pool>, cfg: &Config) {
     let now = Instant::now();
     let mut p = pool.lock().unwrap();
     p.pending = p.pending.saturating_sub(1);

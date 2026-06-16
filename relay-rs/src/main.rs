@@ -166,7 +166,6 @@ struct Conn {
     half_close_since: Option<Instant>,
     connecting: bool,
     connect_start: Instant,
-    closed: bool,
 }
 
 /// Re-arm both fds with the correct EPOLLET + EPOLLRDHUP flags (#2 + #3).
@@ -176,17 +175,28 @@ struct Conn {
 /// buffered. Skipping MOD when flags are unchanged is safe in LT but fatal
 /// in ET — any data left in the socket buffer after a partial read would
 /// never produce another edge, stalling the connection.
-fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize) {
-    if conn.closed {
-        return;
-    }
+///
+/// Flow control: EPOLLIN is suppressed when the pipe for that direction is
+/// already full (len >= splice_chunk).  Without this guard, a congested dst
+/// causes pump() to return immediately (pipe full, dst EAGAIN), conn_watch
+/// unconditionally re-arms EPOLLIN, the kernel sees data in the src buffer
+/// and fires instantly, and the cycle repeats — a busy-loop that burns 100 %
+/// of one CPU core until dst becomes writable again.  Suppressing EPOLLIN
+/// when we cannot consume more data breaks the cycle; EPOLLOUT on the dst fd
+/// will re-arm EPOLLIN once the pipe has been drained.
+fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize, splice_chunk: usize) {
     let token_l = (slab_idx * 2) as u64;
     let token_r = (slab_idx * 2 + 1) as u64;
 
     // fd_l: read client data (l2r), write to client (r2l drain).
     let mut want_l = EpollFlags::EPOLLET;
     if !conn.eof_l2r {
-        want_l |= EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP;
+        want_l |= EpollFlags::EPOLLRDHUP;
+        // Suppress EPOLLIN when the l2r pipe is full — we can't splice more
+        // until the remote (fd_r) side drains it via EPOLLOUT.
+        if conn.len_l2r < splice_chunk {
+            want_l |= EpollFlags::EPOLLIN;
+        }
     }
     if conn.len_r2l > 0 {
         want_l |= EpollFlags::EPOLLOUT;
@@ -195,7 +205,11 @@ fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize) {
     // fd_r: read server data (r2l), write to server (l2r drain).
     let mut want_r = EpollFlags::EPOLLET;
     if !conn.eof_r2l {
-        want_r |= EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP;
+        want_r |= EpollFlags::EPOLLRDHUP;
+        // Suppress EPOLLIN when the r2l pipe is full.
+        if conn.len_r2l < splice_chunk {
+            want_r |= EpollFlags::EPOLLIN;
+        }
     }
     if conn.len_l2r > 0 {
         want_r |= EpollFlags::EPOLLOUT;
@@ -330,7 +344,12 @@ fn main() {
     let pool = Arc::new(Mutex::new(Pool::new(cfg.pool_size)));
     if cfg.pool_size > 0 {
         let cfg_arc = Arc::new(cfg.clone());
-        pool::spawn_maintain_thread(cfg_arc, Arc::clone(&pool), remote_tcp_addr.clone());
+        pool::spawn_maintain_thread(
+            cfg_arc,
+            Arc::clone(&pool),
+            remote_tcp_addr.clone(),
+            &SHUTDOWN,
+        );
     }
 
     let splice_chunk = cfg.splice_chunk;
@@ -388,8 +407,8 @@ fn main() {
                                 None
                             };
 
-                            let (rem_owned, connecting) = if let Some(fd) = pool_fd {
-                                (unsafe { OwnedFd::from_raw_fd(fd) }, false)
+                            let (rem_owned, connecting) = if let Some(owned) = pool_fd {
+                                (owned, false)
                             } else {
                                 log::push("Exceeded Connections Pool, Direct Out...".into());
                                 match direct_connect(&remote_tcp_addr, &cfg) {
@@ -443,7 +462,6 @@ fn main() {
                                 half_close_since: None,
                                 connecting,
                                 connect_start: now,
-                                closed: false,
                             };
                             let slab_idx = alloc_slot(&mut conns, &mut free_slots, conn);
                             let c = conns[slab_idx].as_ref().unwrap();
@@ -463,7 +481,6 @@ fn main() {
                                     EpollEvent::new(init_flags_r, token_r),
                                 ).is_err()
                             {
-                                conns[slab_idx] = None;
                                 free_slot(&mut conns, &mut free_slots, slab_idx);
                             }
                         }
@@ -590,9 +607,6 @@ fn main() {
                 Some(Some(c)) => c,
                 _ => continue,
             };
-            if conn.closed {
-                continue;
-            }
 
             // Handle in-progress connect completing on fd_r.
             if is_remote && conn.connecting {
@@ -606,12 +620,11 @@ fn main() {
                     );
                     if err != Ok(0) {
                         log::push("Connect failed".into());
-                        conns[idx] = None;
                         free_slot(&mut conns, &mut free_slots, idx);
                         continue;
                     }
                     conn.connecting = false;
-                    conn_watch(conn, &epoll, idx);
+                    conn_watch(conn, &epoll, idx, splice_chunk);
                 }
                 continue;
             }
@@ -621,7 +634,6 @@ fn main() {
                 log::push(format!(
                     "Connection Error: {}", if is_remote { "Remote" } else { "Local" }
                 ));
-                conns[idx] = None;
                 free_slot(&mut conns, &mut free_slots, idx);
                 continue;
             }
@@ -639,7 +651,6 @@ fn main() {
                 match res {
                     PumpStatus::Err => {
                         log::push("Connection Error: Local->Remote".into());
-                        conns[idx] = None;
                         free_slot(&mut conns, &mut free_slots, idx);
                         continue;
                     }
@@ -670,7 +681,6 @@ fn main() {
                     }
                 }
                 if drain_err {
-                    conns[idx] = None;
                     free_slot(&mut conns, &mut free_slots, idx);
                     continue;
                 }
@@ -691,7 +701,6 @@ fn main() {
                 match res {
                     PumpStatus::Err => {
                         log::push("Connection Error: Remote->Local".into());
-                        conns[idx] = None;
                         free_slot(&mut conns, &mut free_slots, idx);
                         continue;
                     }
@@ -721,7 +730,6 @@ fn main() {
                     }
                 }
                 if drain_err {
-                    conns[idx] = None;
                     free_slot(&mut conns, &mut free_slots, idx);
                     continue;
                 }
@@ -734,12 +742,11 @@ fn main() {
 
             if conn.eof_l2r && conn.eof_r2l && conn.len_l2r == 0 && conn.len_r2l == 0 {
                 log::push("Connection Fully Closed".into());
-                conns[idx] = None;
                 free_slot(&mut conns, &mut free_slots, idx);
                 continue;
             }
 
-            conn_watch(conn, &epoll, idx);
+            conn_watch(conn, &epoll, idx, splice_chunk);
         }
 
         // ── Periodic cleanup (1 Hz) ──────────────────────────────────────────
@@ -749,9 +756,7 @@ fn main() {
             let mut i = 0;
             while i < conns.len() {
                 let should_remove = if let Some(Some(ref conn)) = conns.get(i) {
-                    if conn.closed {
-                        true
-                    } else if conn.connecting
+                    if conn.connecting
                         && now.duration_since(conn.connect_start)
                             > Duration::from_secs(cfg.connect_timeout)
                     {
@@ -785,7 +790,6 @@ fn main() {
 
                 if should_remove {
                     // OwnedFd Drop closes the fds; epoll auto-removes closed fds on Linux.
-                    conns[i] = None;
                     free_slot(&mut conns, &mut free_slots, i);
                     continue;
                 }
@@ -853,6 +857,8 @@ fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
 }
 
 fn tune_pipe(fd: BorrowedFd<'_>, splice_chunk: usize) {
-    let size = splice_chunk.clamp(16 * 1024, 256 * 1024) as i32;
+    // Clamp to the same range validated by Config::validate() so that the pipe
+    // capacity always matches splice_chunk exactly.
+    let size = splice_chunk.clamp(16 * 1024, 1024 * 1024) as i32;
     let _ = nix::fcntl::fcntl(fd, FcntlArg::F_SETPIPE_SZ(size));
 }

@@ -450,15 +450,19 @@ fn main() {
 
                             let token_l = (slab_idx * 2) as u64;
                             let token_r = (slab_idx * 2 + 1) as u64;
-                            let reg_l = epoll.add(
+                            // Short-circuit: if the first add fails there is no
+                            // point attempting the second — the Conn will be
+                            // freed below and close() auto-deregisters the fd
+                            // from epoll on Linux (no dup anywhere).
+                            if epoll.add(
                                 c.fd_l.as_fd(),
                                 EpollEvent::new(init_flags_l, token_l),
-                            );
-                            let reg_r = epoll.add(
-                                c.fd_r.as_fd(),
-                                EpollEvent::new(init_flags_r, token_r),
-                            );
-                            if reg_l.is_err() || reg_r.is_err() {
+                            ).is_err()
+                                || epoll.add(
+                                    c.fd_r.as_fd(),
+                                    EpollEvent::new(init_flags_r, token_r),
+                                ).is_err()
+                            {
                                 conns[slab_idx] = None;
                                 free_slot(&mut conns, &mut free_slots, slab_idx);
                             }

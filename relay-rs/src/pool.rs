@@ -85,33 +85,41 @@ impl Pool {
 pub fn take_live_unlocked(pool_mutex: &Mutex<Pool>) -> Option<RawFd> {
     const BATCH: usize = 4;
 
-    // Step 1: pop candidates under lock — no I/O.
-    let candidates = pool_mutex.lock().unwrap().pop_batch(BATCH);
-    if candidates.is_empty() {
-        return None;
-    }
-
-    // Step 2: check liveness WITHOUT holding the lock.
-    let mut live_unused: Vec<PoolEntry> = Vec::new();
-    let mut result: Option<RawFd> = None;
-
-    for entry in candidates {
-        if result.is_some() {
-            // Already found a good fd — save the rest to put back.
-            live_unused.push(entry);
-        } else if !sock::socket_dead_fast(entry.fd) {
-            result = Some(entry.fd);
-        } else {
-            let _ = nix::unistd::close(entry.fd);
+    // Keep popping batches until we find a live fd or the pool is empty.
+    // If the first batch's entries are all dead, there may still be live
+    // entries deeper in the pool.  Each iteration does lock-pop (O(1)),
+    // lock-free liveness check, then lock-reinsert of surplus live entries.
+    loop {
+        // Step 1: pop candidates under lock — no I/O.
+        let candidates = pool_mutex.lock().unwrap().pop_batch(BATCH);
+        if candidates.is_empty() {
+            return None;
         }
-    }
 
-    // Step 3: return unused live entries under lock.
-    if !live_unused.is_empty() {
-        pool_mutex.lock().unwrap().entries.extend(live_unused);
-    }
+        // Step 2: check liveness WITHOUT holding the lock.
+        let mut live_unused: Vec<PoolEntry> = Vec::new();
+        let mut result: Option<RawFd> = None;
 
-    result
+        for entry in candidates {
+            if result.is_some() {
+                live_unused.push(entry);
+            } else if !sock::socket_dead_fast(entry.fd) {
+                result = Some(entry.fd);
+            } else {
+                let _ = nix::unistd::close(entry.fd);
+            }
+        }
+
+        // Step 3: return unused live entries under lock.
+        if !live_unused.is_empty() {
+            pool_mutex.lock().unwrap().entries.extend(live_unused);
+        }
+
+        if result.is_some() {
+            return result;
+        }
+        // All candidates were dead → loop and try the next batch.
+    }
 }
 
 pub fn spawn_maintain_thread(
@@ -144,22 +152,35 @@ pub fn spawn_maintain_thread(
         loop {
             thread::sleep(Duration::from_millis(100));
             let now = Instant::now();
-            let mut p = pool.lock().unwrap();
 
-            if now.duration_since(last_sweep) >= Duration::from_secs(1) {
+            // ── Sweep dead connections (batch-pop + lock-free) ─────────────────
+            let need_sweep = now.duration_since(last_sweep) >= Duration::from_secs(1);
+            let mut alive: Vec<PoolEntry> = Vec::new();
+            if need_sweep {
                 last_sweep = now;
-                p.entries.retain(|entry| {
+                // Pop everything, check liveness outside the lock to avoid
+                // holding the mutex during syscalls in socket_dead_fast().
+                let batch = pool.lock().unwrap().pop_batch(usize::MAX);
+                for entry in batch {
                     if sock::socket_dead_fast(entry.fd) {
                         let _ = nix::unistd::close(entry.fd);
                         log::push("Checking: Clear Zombies".into());
-                        false
                     } else {
-                        true
+                        alive.push(entry);
                     }
-                });
+                }
             }
 
-            if now.duration_since(last_rotate) >= Duration::from_secs(1) {
+            // ── Rotate + refill (under one lock) ──────────────────────────────
+            let mut p = pool.lock().unwrap();
+
+            // Re-insert survivors from the lock-free sweep.
+            if need_sweep {
+                p.entries.append(&mut alive);
+            }
+
+            let need_rotate = now.duration_since(last_rotate) >= Duration::from_secs(1);
+            if need_rotate {
                 last_rotate = now;
                 p.entries.retain(|entry| {
                     if now.duration_since(entry.birth).as_millis() as u64 > entry.ttl_ms {

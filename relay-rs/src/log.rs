@@ -9,12 +9,17 @@
 
 use std::io::{self, Write};
 use std::sync::{
+    atomic::{AtomicUsize, Ordering},
     mpsc::{self, Receiver, SyncSender},
     Mutex, OnceLock,
 };
 use std::time::SystemTime;
 
 const LOG_QUEUE_MAX: usize = 4096;
+
+/// Counter for messages dropped during `try_send()` (channel full).
+/// Updated atomically from any thread without a lock.
+static SEND_DROPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Sender half — cloneable, shared with worker threads via `LOG_TX`.
 static LOG_TX: OnceLock<SyncSender<String>> = OnceLock::new();
@@ -50,12 +55,9 @@ pub fn init(enabled: bool, rate: usize) {
 /// bounded queue is full (the next flush will report a "Log dropped" notice).
 pub fn push(msg: String) {
     if let Some(tx) = LOG_TX.get() {
-        // try_send never blocks; on failure the message is simply discarded.
-        // We can't safely increment `dropped` here without a lock, so the
-        // bound itself acts as the backpressure signal: when the queue is
-        // full, lines are discarded and the bounded-channel contract ensures
-        // maybe_flush() will catch up on the next iteration.
-        let _ = tx.try_send(msg);
+        if tx.try_send(msg).is_err() {
+            SEND_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -83,10 +85,13 @@ pub fn maybe_flush() {
     }
 
     // Emit the drop-count notice first (matches C version's log_dropped behaviour).
-    if st.dropped > 0 && st.quota > 0 {
-        let n = st.dropped;
+    // Collect both send-side drops (channel full) and drain-side drops (quota
+    // exhausted) for an accurate count.
+    let send_drops = SEND_DROPS.swap(0, Ordering::Relaxed);
+    let total_drops = st.dropped + send_drops;
+    if total_drops > 0 && st.quota > 0 {
+        let _ = writeln!(io::stdout().lock(), "Log dropped: {total_drops}");
         st.dropped = 0;
-        let _ = writeln!(io::stdout().lock(), "Log dropped: {n}");
         st.quota -= 1;
     }
 

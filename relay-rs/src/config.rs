@@ -70,19 +70,19 @@ fn default_pool_size() -> usize {
     24
 }
 fn default_refill_batch() -> usize {
-    2
+    8
 }
 fn default_connect_timeout() -> u64 {
     5
 }
 fn default_idle_timeout() -> u64 {
-    240
+    180
 }
 fn default_half_close_timeout() -> u64 {
-    10
+    6
 }
 fn default_preconnect_ttl_ms() -> u64 {
-    300_000
+    60_000
 }
 fn default_splice_chunk() -> usize {
     65_536
@@ -103,13 +103,13 @@ fn default_log_enable() -> bool {
     true
 }
 fn default_tcp_keepidle() -> i32 {
-    360
+    45
 }
 fn default_tcp_keepintvl() -> i32 {
-    15
+    10
 }
 fn default_tcp_keepcnt() -> i32 {
-    1
+    2
 }
 fn default_tcp_user_timeout_ms() -> i32 {
     0

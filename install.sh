@@ -150,12 +150,6 @@ remote_ip       = "CHANGE_ME"
 remote_tcp_port = 443
 remote_udp_port = 443
 
-# Runtime tuning
-pool_size           = 24
-refill_batch        = 2
-preconnect_ttl_ms   = 300000
-splice_chunk        = 65536
-log_enable          = true
 TOML
     info "created ${CONF_FILE} — edit remote_ip before starting"
 else

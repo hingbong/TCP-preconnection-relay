@@ -31,16 +31,16 @@ refill_batch      = 8
 connect_timeout   = 5
 
 # Seconds of inactivity before closing a relayed connection.
-idle_timeout      = 240
+idle_timeout      = 180
 
 # Seconds to wait after one side sends EOF before tearing down.
-half_close_timeout = 10
+half_close_timeout = 6
 
 # Milliseconds — pool sockets older than this are rotated (anti-QoS).
-preconnect_ttl_ms = 50000
+preconnect_ttl_ms = 60000
 
 # Bytes — maximum data buffered in the splice pipe at any time.
-splice_chunk      = 262144
+splice_chunk      = 65536
 
 # ── UDP ───────────────────────────────────────────────────────────
 #
@@ -66,13 +66,13 @@ log_enable        = true
 # ── TCP Keepalive ─────────────────────────────────────────────────
 #
 # Seconds of idle time before the kernel starts sending keepalive probes.
-tcp_keepidle      = 360
+tcp_keepidle      = 45
 
 # Seconds between successive keepalive probes.
-tcp_keepintvl     = 15
+tcp_keepintvl     = 10
 
 # Number of failed probes before the connection is marked dead.
-tcp_keepcnt       = 1
+tcp_keepcnt       = 2
 
 # Milliseconds — TCP_USER_TIMEOUT.
 # 0 means use the system default (typically ~13 minutes).

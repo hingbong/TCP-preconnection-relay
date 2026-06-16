@@ -67,6 +67,20 @@ const TOKEN_UDP: u64 = u64::MAX - 1;
 // UDP upstream sockets: tokens [UDP_BASE, UDP_BASE + slot_idx)
 const UDP_BASE: u64 = 1 << 26;
 
+// ── Epoll token encoding (ABA-safe) ────────────────────────────────────
+// Layout: [gen:16][slab_idx:47][side:1]
+// gen wraps at 65536. Stale events from a freed+reused slot carry
+// the old gen → mismatch → silently skipped.
+fn encode_token(gen: u16, idx: usize, side: u8) -> u64 {
+    ((gen as u64) << 48) | ((idx as u64) << 1) | (side as u64)
+}
+fn decode_token(token: u64) -> (u16, usize, bool) {
+    let gen = (token >> 48) as u16;
+    let idx = ((token & 0x0000_FFFF_FFFF_FFFE) >> 1) as usize;
+    let is_remote = (token & 1) != 0;
+    (gen, idx, is_remote)
+}
+
 // ── Zero-copy pump ───────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
@@ -153,6 +167,7 @@ fn pump(
 ///  * Correct lifetimes — no 'static lifetime erasure (#5).
 ///  * Automatic close via Drop when the Conn is freed from the slab.
 struct Conn {
+    gen: u16, // generation counter for ABA-safe tokens
     fd_l: OwnedFd,
     fd_r: OwnedFd,
     pipe_l2r_w: OwnedFd, // write end of local→remote splice pipe
@@ -189,8 +204,8 @@ struct Conn {
 /// when we cannot consume more data breaks the cycle; EPOLLOUT on the dst fd
 /// will re-arm EPOLLIN once the pipe has been drained.
 fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize, splice_chunk: usize) {
-    let token_l = (slab_idx * 2) as u64;
-    let token_r = (slab_idx * 2 + 1) as u64;
+    let token_l = encode_token(conn.gen, slab_idx, 0);
+    let token_r = encode_token(conn.gen, slab_idx, 1);
 
     // fd_l: read client data (l2r), write to client (r2l drain).
     let mut want_l = EpollFlags::EPOLLET;
@@ -378,6 +393,7 @@ fn main() {
     // TCP connection slab: token = slab_idx*2 (local fd) or slab_idx*2+1 (remote fd).
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut free_slots: VecDeque<usize> = VecDeque::new();
+    let mut slab_gen: u16 = 0;
 
     // UDP association slab: token = UDP_BASE + slot_idx.
     let mut udp_map: HashMap<std::net::SocketAddr, usize> = HashMap::new();
@@ -465,7 +481,11 @@ fn main() {
                                 EpollFlags::EPOLLET | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP
                             };
 
+                            let gen = slab_gen;
+                            slab_gen = slab_gen.wrapping_add(1);
+
                             let conn = Conn {
+                                gen,
                                 fd_l: cli_owned,
                                 fd_r: rem_owned,
                                 pipe_l2r_w,
@@ -487,8 +507,8 @@ fn main() {
                             let slab_idx = alloc_slot(&mut conns, &mut free_slots, conn);
                             let c = conns[slab_idx].as_ref().unwrap();
 
-                            let token_l = (slab_idx * 2) as u64;
-                            let token_r = (slab_idx * 2 + 1) as u64;
+                            let token_l = encode_token(c.gen, slab_idx, 0);
+                            let token_r = encode_token(c.gen, slab_idx, 1);
                             // Short-circuit: if the first add fails there is no
                             // point attempting the second — the Conn will be
                             // freed below and close() auto-deregisters the fd
@@ -624,12 +644,10 @@ fn main() {
             }
 
             // ── TCP connection event ──────────────────────────────────────────
-            let raw = token as usize;
-            let is_remote = (raw & 1) != 0;
-            let idx = raw >> 1;
+            let (ev_gen, idx, is_remote) = decode_token(token);
             let conn = match conns.get_mut(idx) {
-                Some(Some(c)) => c,
-                _ => continue,
+                Some(Some(c)) if c.gen == ev_gen => c,
+                _ => continue, // stale event (ABA) or empty slot
             };
 
             // Handle in-progress connect completing on fd_r.

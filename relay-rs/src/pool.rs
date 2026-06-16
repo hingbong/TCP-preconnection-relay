@@ -1,4 +1,4 @@
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::io::IntoRawFd;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -11,10 +11,6 @@ use crate::config::Config;
 use crate::log;
 use crate::sock;
 
-fn bfd(fd: RawFd) -> BorrowedFd<'static> {
-    unsafe { BorrowedFd::borrow_raw(fd) }
-}
-
 struct PoolEntry {
     fd: RawFd,
     birth: Instant,
@@ -24,13 +20,10 @@ struct PoolEntry {
 pub struct Pool {
     entries: Vec<PoolEntry>,
     pub max_size: usize,
-    // These fields are always accessed under the outer Mutex<Pool> lock;
-    // plain integers are simpler and faster than nested atomics/mutexes.
     pub pending: usize,
     fail_streak: usize,
     pub pause_until: Option<Instant>,
-    /// Xorshift64 state for cheap ±25 % TTL jitter — keeps all pre-connects
-    /// from expiring simultaneously and triggering a connection burst.
+    /// Xorshift64 state for cheap ±25 % TTL jitter.
     rng: u64,
 }
 
@@ -46,7 +39,6 @@ impl Pool {
         }
     }
 
-    /// Xorshift64 — fast, non-crypto, good enough for jitter.
     fn next_rng(&mut self) -> u64 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
@@ -54,21 +46,16 @@ impl Pool {
         self.rng
     }
 
-    /// Jitter base_ms by ±25 %: output is in [0.75 × base, 1.25 × base].
     fn jittered_ttl(&mut self, base_ms: u64) -> u64 {
         let quarter = base_ms / 4;
-        let span = quarter * 2 + 1; // range width
+        let span = quarter * 2 + 1;
         base_ms - quarter + (self.next_rng() % span)
     }
 
     pub fn put(&mut self, fd: RawFd, now: Instant, base_ttl_ms: u64) -> bool {
         if self.entries.len() < self.max_size {
             let ttl_ms = self.jittered_ttl(base_ttl_ms);
-            self.entries.push(PoolEntry {
-                fd,
-                birth: now,
-                ttl_ms,
-            });
+            self.entries.push(PoolEntry { fd, birth: now, ttl_ms });
             true
         } else {
             let _ = nix::unistd::close(fd);
@@ -76,21 +63,57 @@ impl Pool {
         }
     }
 
-    pub fn take_live(&mut self) -> Option<RawFd> {
-        loop {
-            let entry = self.entries.pop()?;
-            if sock::socket_dead_fast(entry.fd) {
-                let _ = nix::unistd::close(entry.fd);
-                continue;
-            }
-            return Some(entry.fd);
+    /// Pop up to `n` raw entries (no liveness checks) without any I/O.
+    /// O(n), sub-microsecond lock hold time.
+    fn pop_batch(&mut self, n: usize) -> Vec<PoolEntry> {
+        let len = self.entries.len();
+        let take = len.min(n);
+        if take == 0 {
+            return Vec::new();
         }
+        self.entries.drain(len - take..).collect()
     }
 }
 
-/// Spawn a fixed pool of worker threads plus a maintenance thread.
-/// Workers are long-lived and receive tasks via a shared channel, avoiding
-/// the per-connection thread-spawn overhead of the original design.
+/// Acquire one live pre-connected fd from the pool.
+///
+/// Addresses issue #1: the previous `take_live()` held the `Pool` mutex
+/// during `socket_dead_fast()` — three syscalls per dead entry.  This
+/// function pops a small batch *under the lock* (no I/O), checks liveness
+/// *outside the lock*, then returns unused live entries *under the lock*.
+/// The mutex is held for two O(1) array operations, never for syscalls.
+pub fn take_live_unlocked(pool_mutex: &Mutex<Pool>) -> Option<RawFd> {
+    const BATCH: usize = 4;
+
+    // Step 1: pop candidates under lock — no I/O.
+    let candidates = pool_mutex.lock().unwrap().pop_batch(BATCH);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Step 2: check liveness WITHOUT holding the lock.
+    let mut live_unused: Vec<PoolEntry> = Vec::new();
+    let mut result: Option<RawFd> = None;
+
+    for entry in candidates {
+        if result.is_some() {
+            // Already found a good fd — save the rest to put back.
+            live_unused.push(entry);
+        } else if !sock::socket_dead_fast(entry.fd) {
+            result = Some(entry.fd);
+        } else {
+            let _ = nix::unistd::close(entry.fd);
+        }
+    }
+
+    // Step 3: return unused live entries under lock.
+    if !live_unused.is_empty() {
+        pool_mutex.lock().unwrap().entries.extend(live_unused);
+    }
+
+    result
+}
+
 pub fn spawn_maintain_thread(
     cfg: Arc<Config>,
     pool: Arc<Mutex<Pool>>,
@@ -99,9 +122,6 @@ pub fn spawn_maintain_thread(
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let rx = Arc::new(Mutex::new(rx));
 
-    // Spawn `refill_batch` persistent workers that compete for tasks.
-    // The Mutex<Receiver> pattern ensures each task is delivered to exactly
-    // one worker while allowing all workers to run in parallel.
     let num_workers = cfg.refill_batch;
     for _ in 0..num_workers {
         let rx = Arc::clone(&rx);
@@ -109,12 +129,10 @@ pub fn spawn_maintain_thread(
         let cfg2 = Arc::clone(&cfg);
         let addr2 = remote_addr.clone();
         thread::spawn(move || loop {
-            // Only hold the mutex for the duration of recv() so that
-            // workers are never blocked by each other while doing work.
             let msg = rx.lock().unwrap().recv();
             match msg {
                 Ok(()) => refill_one(&cfg2, &addr2, &pool2),
-                Err(_) => break, // sender dropped — shut down
+                Err(_) => break,
             }
         });
     }
@@ -124,9 +142,6 @@ pub fn spawn_maintain_thread(
         let mut last_rotate = Instant::now();
 
         loop {
-            // Refill responsiveness does not require sweeping every pool fd.
-            // Keep the refill tick short, but move expensive socket checks to
-            // lower-frequency timers to reduce CPU bursts.
             thread::sleep(Duration::from_millis(100));
             let now = Instant::now();
             let mut p = pool.lock().unwrap();
@@ -157,15 +172,17 @@ pub fn spawn_maintain_thread(
                 });
             }
 
-            // Refill up to deficit, but cap each tick to avoid connect bursts.
             let deficit = cfg.pool_size.saturating_sub(p.entries.len() + p.pending);
             let paused = p.pause_until.map_or(false, |pu| now < pu);
             if deficit > 0 && !paused {
-                let want = deficit.min(cfg.refill_batch).min(2);
+                // Adaptive cap (#6): recover at full refill_batch speed when the
+                // pool is more than half empty; throttle to 2 for steady-state
+                // top-ups to avoid connect bursts.
+                let cap = if deficit > cfg.pool_size / 2 { cfg.refill_batch } else { 2 };
+                let want = deficit.min(cfg.refill_batch).min(cap);
                 for _ in 0..want {
                     p.pending += 1;
                     if tx.send(()).is_err() {
-                        // All workers have exited — stop trying to refill.
                         p.pending -= 1;
                         break;
                     }
@@ -176,58 +193,51 @@ pub fn spawn_maintain_thread(
 }
 
 fn refill_one(cfg: &Config, remote_addr: &socket2::SockAddr, pool: &Mutex<Pool>) {
-    match sock::create_tcp_socket(remote_addr.domain(), cfg, None) {
-        Ok(sock) => {
-            let fd = sock.into_raw_fd();
-
-            // Resolve socket2::SockAddr to nix SockaddrStorage for connect()
-            let remote_ptr = remote_addr.as_ptr() as *const libc::sockaddr;
-            let remote_len = remote_addr.len();
-            let nix_addr = unsafe { SockaddrStorage::from_raw(remote_ptr, Some(remote_len)) };
-            let nix_addr = match nix_addr {
-                Some(a) => a,
-                None => {
-                    let _ = nix::unistd::close(fd);
-                    connect_fail(pool, cfg);
-                    return;
-                }
-            };
-
-            match connect(fd, &nix_addr) {
-                Ok(()) => {
-                    connect_success(fd, pool, cfg);
-                    return;
-                }
-                Err(nix::Error::EINPROGRESS) => {
-                    // Wait for completion
-                    let b = bfd(fd);
-                    let mut pfd = [PollFd::new(b, PollFlags::POLLOUT)];
-                    // Clamp to u16::MAX (65535 ms ≈ 65 s) — nix only supports
-                    // From<u16> for PollTimeout on this platform.
-                    let timeout_ms = cfg
-                        .connect_timeout
-                        .saturating_mul(1000)
-                        .min(u16::MAX as u64) as u16;
-                    let timeout = PollTimeout::from(timeout_ms);
-                    if let Ok(n) = poll(&mut pfd, timeout) {
-                        if n > 0 {
-                            if let Ok(0) = getsockopt(&bfd(fd), SocketError) {
-                                connect_success(fd, pool, cfg);
-                                return;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-
-            let _ = nix::unistd::close(fd);
-            connect_fail(pool, cfg);
-        }
+    // Wrap in OwnedFd immediately so the fd is closed automatically on any
+    // early-return error path — no explicit nix::unistd::close() needed (#5).
+    let owned = match sock::create_tcp_socket(remote_addr.domain(), cfg, None) {
+        Ok(s) => unsafe { OwnedFd::from_raw_fd(s.into_raw_fd()) },
         Err(_) => {
             connect_fail(pool, cfg);
+            return;
         }
+    };
+
+    let remote_ptr = remote_addr.as_ptr() as *const libc::sockaddr;
+    let remote_len = remote_addr.len();
+    let nix_addr = match unsafe { SockaddrStorage::from_raw(remote_ptr, Some(remote_len)) } {
+        Some(a) => a,
+        None => {
+            connect_fail(pool, cfg);
+            return; // owned drops → fd closed
+        }
+    };
+
+    match connect(owned.as_raw_fd(), &nix_addr) {
+        Ok(()) => {
+            connect_success(owned.into_raw_fd(), pool, cfg);
+            return;
+        }
+        Err(nix::Error::EINPROGRESS) => {
+            let timeout_ms = cfg
+                .connect_timeout
+                .saturating_mul(1000)
+                .min(u16::MAX as u64) as u16;
+            let mut pfd = [PollFd::new(owned.as_fd(), PollFlags::POLLOUT)];
+            if let Ok(n) = poll(&mut pfd, PollTimeout::from(timeout_ms)) {
+                if n > 0 {
+                    if let Ok(0) = getsockopt(&owned, SocketError) {
+                        connect_success(owned.into_raw_fd(), pool, cfg);
+                        return;
+                    }
+                }
+            }
+        }
+        _ => {}
     }
+
+    // owned drops here → fd closed automatically.
+    connect_fail(pool, cfg);
 }
 
 fn connect_success(fd: RawFd, pool: &Mutex<Pool>, cfg: &Config) {
@@ -259,3 +269,4 @@ fn connect_fail(pool: &Mutex<Pool>, cfg: &Config) {
         p.pause_until = Some(Instant::now() + backoff);
     }
 }
+

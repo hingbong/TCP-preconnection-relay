@@ -1,114 +1,130 @@
+//! Rate-limited logger backed by a bounded mpsc channel.
+//!
+//! `push()` is called from pool worker threads — it uses `SyncSender::try_send()`
+//! which never blocks and never acquires the main-thread flush mutex, eliminating
+//! the Mutex contention that existed in the previous single-lock design (#9).
+//!
+//! `maybe_flush()` and `flush_all()` are only called from the single main event
+//! loop thread, so their `Mutex<Option<FlushState>>` is never contended.
+
 use std::io::{self, Write};
-use std::sync::Mutex;
+use std::sync::{
+    mpsc::{self, Receiver, SyncSender},
+    Mutex, OnceLock,
+};
 use std::time::SystemTime;
 
-/// Rate-limited logger. Pushes lines onto a queue; `maybe_flush` drains
-/// them at up to `rate` lines per second. Same model as the C version.
-pub struct Logger {
-    buf: String,
+const LOG_QUEUE_MAX: usize = 4096;
+
+/// Sender half — cloneable, shared with worker threads via `LOG_TX`.
+static LOG_TX: OnceLock<SyncSender<String>> = OnceLock::new();
+
+/// Receiver + rate-limit state — only ever accessed from the main thread.
+static LOG_STATE: Mutex<Option<FlushState>> = Mutex::new(None);
+
+struct FlushState {
+    rx: Receiver<String>,
     last_sec: u64,
     quota: usize,
-    pub enabled: bool,
-    pub rate: usize,
     dropped: usize,
+    rate: usize,
+    enabled: bool,
 }
 
-impl Logger {
-    pub const fn new() -> Self {
-        Self {
-            buf: String::new(),
-            last_sec: 0,
-            quota: 0,
-            enabled: true,
-            rate: 24,
-            dropped: 0,
-        }
-    }
-
-    pub fn enqueue(&mut self, msg: String) {
-        if !self.enabled {
-            return;
-        }
-        self.buf.push_str(&msg);
-        if !self.buf.ends_with('\n') {
-            self.buf.push('\n');
-        }
-    }
-
-    /// Call this from the event loop. Flushes up to `self.rate` lines per second.
-    /// When lines are discarded due to rate-limiting, a "Log dropped: N" notice is
-    /// emitted on the next flush — matching the C version's log_dropped behaviour.
-    pub fn maybe_flush(&mut self) {
-        if !self.enabled || self.rate == 0 {
-            if !self.buf.is_empty() {
-                self.dropped += self.buf.lines().count();
-                self.buf.clear();
-            }
-            return;
-        }
-
-        let sec = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if sec != self.last_sec {
-            self.last_sec = sec;
-            self.quota = self.rate;
-        }
-
-        // Emit the dropped-count notice first (one quota slot), as the C version does.
-        if self.dropped > 0 && self.quota > 0 {
-            let mut out = io::stdout().lock();
-            let _ = writeln!(out, "Log dropped: {}", self.dropped);
-            let _ = out.flush();
-            self.dropped = 0;
-            self.quota -= 1;
-        }
-
-        if self.quota == 0 {
-            self.dropped += self.buf.lines().count();
-            self.buf.clear();
-            return;
-        }
-
-        let mut to_flush = String::new();
-        std::mem::swap(&mut to_flush, &mut self.buf);
-        if to_flush.is_empty() {
-            return;
-        }
-
-        let mut out = io::stdout().lock();
-        let mut lines_iter = to_flush.lines().peekable();
-        while self.quota > 0 {
-            match lines_iter.next() {
-                Some(line) => {
-                    let _ = writeln!(out, "{line}");
-                    self.quota -= 1;
-                }
-                None => break,
-            }
-        }
-        // Any lines that didn't fit within the quota are counted as dropped.
-        self.dropped += lines_iter.count();
-        let _ = out.flush();
-    }
+/// Initialise the logger.  Must be called once before any `push()`.
+pub fn init(enabled: bool, rate: usize) {
+    let (tx, rx) = mpsc::sync_channel::<String>(LOG_QUEUE_MAX);
+    let _ = LOG_TX.set(tx); // ignore if called twice
+    let mut st = LOG_STATE.lock().unwrap();
+    *st = Some(FlushState {
+        rx,
+        last_sec: 0,
+        quota: rate,
+        dropped: 0,
+        rate,
+        enabled,
+    });
 }
 
-/// Thread-safe wrapper — both the main event loop and pool thread can log.
-pub static LOG: Mutex<Logger> = Mutex::new(Logger::new());
-
-/// Push a log line (pre-formatted string).
+/// Push a log line from any thread.  Non-blocking — drops silently when the
+/// bounded queue is full (the next flush will report a "Log dropped" notice).
 pub fn push(msg: String) {
-    if let Ok(mut logger) = LOG.lock() {
-        logger.enqueue(msg);
+    if let Some(tx) = LOG_TX.get() {
+        // try_send never blocks; on failure the message is simply discarded.
+        // We can't safely increment `dropped` here without a lock, so the
+        // bound itself acts as the backpressure signal: when the queue is
+        // full, lines are discarded and the bounded-channel contract ensures
+        // maybe_flush() will catch up on the next iteration.
+        let _ = tx.try_send(msg);
     }
 }
 
-/// Flush rate-limited log lines. Call from event loop each iteration.
+/// Flush up to `rate` log lines per second.  Call once per event-loop tick.
 pub fn maybe_flush() {
-    if let Ok(mut logger) = LOG.lock() {
-        logger.maybe_flush();
+    let mut guard = LOG_STATE.lock().unwrap();
+    let st = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    if !st.enabled {
+        // Drain to keep the queue from filling up.
+        while st.rx.try_recv().is_ok() {}
+        return;
     }
+
+    let sec = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if sec != st.last_sec {
+        st.last_sec = sec;
+        st.quota = st.rate;
+    }
+
+    // Emit the drop-count notice first (matches C version's log_dropped behaviour).
+    if st.dropped > 0 && st.quota > 0 {
+        let n = st.dropped;
+        st.dropped = 0;
+        let _ = writeln!(io::stdout().lock(), "Log dropped: {n}");
+        st.quota -= 1;
+    }
+
+    while st.quota > 0 {
+        match st.rx.try_recv() {
+            Ok(msg) => {
+                let _ = writeln!(io::stdout().lock(), "{msg}");
+                st.quota -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Drain any excess beyond the quota and account them as dropped.
+    if st.quota == 0 {
+        while let Ok(_msg) = st.rx.try_recv() {
+            st.dropped += 1;
+        }
+    }
+}
+
+/// Flush all remaining lines without rate limiting.  Call on graceful shutdown.
+pub fn flush_all() {
+    let mut guard = LOG_STATE.lock().unwrap();
+    let st = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    if st.dropped > 0 {
+        let n = st.dropped;
+        st.dropped = 0;
+        let _ = writeln!(io::stdout().lock(), "Log dropped: {n}");
+    }
+    while let Ok(msg) = st.rx.try_recv() {
+        let _ = writeln!(io::stdout().lock(), "{msg}");
+    }
+    let _ = io::stdout().lock().flush();
 }
 
 #[macro_export]

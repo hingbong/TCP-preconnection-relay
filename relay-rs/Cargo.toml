@@ -6,9 +6,8 @@ description = "High-performance TCP/UDP preconnection relay with zero-copy splic
 license = "MIT"
 
 [dependencies]
-mio = { version = "1.2", features = ["os-poll", "net", "os-ext"] }
 socket2 = { version = "0.6", features = ["all"] }
-nix = { version = "0.31", features = ["socket", "poll", "signal", "resource", "fs", "ioctl", "zerocopy"] }
+nix = { version = "0.31", features = ["socket", "poll", "signal", "resource", "fs", "ioctl", "zerocopy", "event", "net"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,6 +18,7 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"
 
 [profile.dev]
 opt-level = 1

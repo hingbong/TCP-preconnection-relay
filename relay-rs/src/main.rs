@@ -1,41 +1,47 @@
 //! Main event loop, zero-copy splice pump, TCP/UDP forwarding, connection lifecycle.
 //!
-//! Architecture mirrors the C version's single-threaded epoll + splice model.
-//! All system calls use safe nix/socket2 wrappers — zero `unsafe` in business logic.
+//! Key improvements over the original Rust rewrite:
+//! * #2+#3: Raw nix epoll with EPOLLET + EPOLLRDHUP instead of mio LT mode.
+//! * #4:    Safe nix wrappers for the entire UDP path (no more libc unsafe blocks).
+//! * #5:    OwnedFd in Conn — lifetimes are correct and fds close automatically.
+//! * #7:    SIGTERM/SIGINT handler with AtomicBool for graceful shutdown.
 
 mod config;
 mod log;
 mod pool;
 mod sock;
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::io::FromRawFd;
+use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Registry, Token};
-use std::os::fd::BorrowedFd;
-
 use nix::errno::Errno;
 use nix::fcntl::{splice, FcntlArg, SpliceFFlags};
-use nix::sys::signal::{signal, SigHandler, Signal};
-use nix::sys::socket::SockaddrLike;
-use nix::sys::socket::{accept4, connect, send, MsgFlags, SockFlag, SockaddrStorage};
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::socket::{
+    accept4, connect, recvfrom, sendto, MsgFlags, SockFlag, SockaddrLike, SockaddrStorage,
+};
 use nix::unistd::pipe2;
 use socket2::{SockAddr, Socket, Type};
-
-/// Unsafe helper: borrow `RawFd` as `BorrowedFd<'static>` for nix calls.
-fn bfd(fd: RawFd) -> BorrowedFd<'static> {
-    unsafe { BorrowedFd::borrow_raw(fd) }
-}
 
 use config::Config;
 use pool::Pool;
 use sock as s;
+
+// ── Signal handling (#7) ─────────────────────────────────────────────────────
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_shutdown(_sig: libc::c_int) {
+    // AtomicBool store is async-signal-safe.
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+// ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "relay", about = "TCP/UDP preconnection relay (Rust rewrite)")]
@@ -54,12 +60,14 @@ struct Cli {
     remote_udp_port: Option<u16>,
 }
 
-const TOKEN_ACCEPT: Token = Token(usize::MAX);
-const TOKEN_UDP: Token = Token(usize::MAX - 1);
-// UDP upstream sockets use tokens in [UDP_UPSTREAM_BASE, ...), which is
-// well above any realistic TCP slab token (slab_idx*2) and below the
-// special sentinel tokens near usize::MAX.
-const UDP_UPSTREAM_BASE: usize = 1 << 26;
+// ── Epoll token constants ────────────────────────────────────────────────────
+
+const TOKEN_ACCEPT: u64 = u64::MAX;
+const TOKEN_UDP: u64 = u64::MAX - 1;
+// UDP upstream sockets: tokens [UDP_BASE, UDP_BASE + slot_idx)
+const UDP_BASE: u64 = 1 << 26;
+
+// ── Zero-copy pump ───────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
 enum PumpStatus {
@@ -68,55 +76,13 @@ enum PumpStatus {
     Err,
 }
 
-struct Conn {
-    fd_l: RawFd,
-    fd_r: RawFd,
-    pipe_l2r: RawFd,
-    pipe_r2l: RawFd,
-    pipe_l2r_read: RawFd,
-    pipe_r2l_read: RawFd,
-    len_l2r: usize,
-    len_r2l: usize,
-    last_l2r: Instant,
-    last_r2l: Instant,
-    eof_l2r: bool,
-    eof_r2l: bool,
-    shut_wr_r: bool,
-    shut_wr_l: bool,
-    half_close_since: Option<Instant>,
-    connecting: bool,
-    connect_start: Instant,
-    closed: bool,
-    interest_l: Interest,
-    interest_r: Interest,
-}
-
-impl Conn {
-    fn close_all(&mut self) {
-        if self.closed {
-            return;
-        }
-        self.closed = true;
-        let _ = nix::unistd::close(self.fd_l);
-        let _ = nix::unistd::close(self.fd_r);
-        let _ = nix::unistd::close(self.pipe_l2r);
-        let _ = nix::unistd::close(self.pipe_l2r_read);
-        let _ = nix::unistd::close(self.pipe_r2l);
-        let _ = nix::unistd::close(self.pipe_r2l_read);
-    }
-}
-
-impl Drop for Conn {
-    fn drop(&mut self) {
-        self.close_all();
-    }
-}
-
+/// Splice data from `src` → pipe → `dst`.  Drains until EAGAIN on both ends.
+/// Borrows `BorrowedFd<'_>` derived from `OwnedFd` fields — no lifetime erasure.
 fn pump(
-    src_fd: RawFd,
-    dst_fd: RawFd,
-    pipe_write_fd: RawFd,
-    pipe_read_fd: RawFd,
+    src: BorrowedFd<'_>,
+    dst: BorrowedFd<'_>,
+    pipe_w: BorrowedFd<'_>,
+    pipe_r: BorrowedFd<'_>,
     pipe_len: &mut usize,
     splice_chunk: usize,
     now: Instant,
@@ -124,16 +90,10 @@ fn pump(
 ) -> PumpStatus {
     let mut got_eof = false;
     let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
-    let (s, pw, pr, d) = (
-        bfd(src_fd),
-        bfd(pipe_write_fd),
-        bfd(pipe_read_fd),
-        bfd(dst_fd),
-    );
 
     while *pipe_len < splice_chunk {
         let remain = splice_chunk - *pipe_len;
-        match splice(s, None, pw, None, remain, flags) {
+        match splice(src, None, pipe_w, None, remain, flags) {
             Ok(n) if n > 0 => {
                 *pipe_len += n;
                 *last_ts = now;
@@ -151,72 +111,117 @@ fn pump(
     }
 
     while *pipe_len > 0 {
-        match splice(pr, None, d, None, *pipe_len, flags) {
+        match splice(pipe_r, None, dst, None, *pipe_len, flags) {
             Ok(n) if n > 0 => {
                 *pipe_len -= n;
                 *last_ts = now;
             }
             Err(Errno::EAGAIN) => break,
             Err(_) => return PumpStatus::Err,
-            Ok(_) => {} // n == 0, shouldn't happen for non-blocking pipe→socket
+            Ok(_) => {}
         }
     }
 
-    if got_eof {
-        PumpStatus::Eof
-    } else {
-        PumpStatus::Ok
-    }
+    if got_eof { PumpStatus::Eof } else { PumpStatus::Ok }
 }
 
-fn conn_watch(conn: &mut Conn, registry: &Registry, slab_idx: usize) {
+// ── TCP connection state ─────────────────────────────────────────────────────
+
+/// All file descriptors are OwnedFd so:
+///  * Correct lifetimes — no 'static lifetime erasure (#5).
+///  * Automatic close via Drop when the Conn is freed from the slab.
+struct Conn {
+    fd_l: OwnedFd,
+    fd_r: OwnedFd,
+    pipe_l2r_w: OwnedFd, // write end of local→remote splice pipe
+    pipe_l2r_r: OwnedFd, // read  end
+    pipe_r2l_w: OwnedFd, // write end of remote→local splice pipe
+    pipe_r2l_r: OwnedFd, // read  end
+    len_l2r: usize,
+    len_r2l: usize,
+    last_l2r: Instant,
+    last_r2l: Instant,
+    eof_l2r: bool,
+    eof_r2l: bool,
+    shut_wr_r: bool,
+    shut_wr_l: bool,
+    half_close_since: Option<Instant>,
+    connecting: bool,
+    connect_start: Instant,
+    closed: bool,
+    // Cached epoll interest masks so we only call epoll_ctl(MOD) when they change.
+    epoll_flags_l: EpollFlags,
+    epoll_flags_r: EpollFlags,
+}
+
+/// Re-arm both fds with the correct EPOLLET + EPOLLRDHUP flags (#2 + #3).
+/// Only calls epoll_ctl(MOD) when the desired mask has actually changed,
+/// matching the C version's conn_watch() optimisation.
+fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize) {
     if conn.closed {
         return;
     }
-    // Token scheme: local = slab_idx*2, remote = slab_idx*2+1.
-    // Cache the last Interest to avoid unnecessary epoll_ctl(EPOLL_CTL_MOD)
-    // calls on every event. This reduces CPU bursts during reconnects and
-    // small-packet workloads.
-    let token_l = Token(slab_idx * 2);
-    let token_r = Token(slab_idx * 2 + 1);
+    let token_l = (slab_idx * 2) as u64;
+    let token_r = (slab_idx * 2 + 1) as u64;
 
-    let int_l = if conn.len_r2l > 0 {
-        Interest::READABLE | Interest::WRITABLE
-    } else {
-        Interest::READABLE
-    };
-    if int_l != conn.interest_l {
-        if registry
-            .reregister(&mut SourceFd(&conn.fd_l), token_l, int_l)
-            .is_ok()
-        {
-            conn.interest_l = int_l;
-        }
+    // fd_l: read client data (l2r), write to client (r2l drain).
+    let mut want_l = EpollFlags::EPOLLET;
+    if !conn.eof_l2r {
+        want_l |= EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP;
+    }
+    if conn.len_r2l > 0 {
+        want_l |= EpollFlags::EPOLLOUT;
     }
 
-    let int_r = if conn.len_l2r > 0 {
-        Interest::READABLE | Interest::WRITABLE
-    } else {
-        Interest::READABLE
-    };
-    if int_r != conn.interest_r {
-        if registry
-            .reregister(&mut SourceFd(&conn.fd_r), token_r, int_r)
-            .is_ok()
-        {
-            conn.interest_r = int_r;
-        }
+    // fd_r: read server data (r2l), write to server (l2r drain).
+    let mut want_r = EpollFlags::EPOLLET;
+    if !conn.eof_r2l {
+        want_r |= EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP;
+    }
+    if conn.len_l2r > 0 {
+        want_r |= EpollFlags::EPOLLOUT;
+    }
+
+    if want_l != conn.epoll_flags_l {
+        let mut ev_l = EpollEvent::new(want_l, token_l);
+        let _ = epoll.modify(&conn.fd_l, &mut ev_l);
+        conn.epoll_flags_l = want_l;
+    }
+    if want_r != conn.epoll_flags_r {
+        let mut ev_r = EpollEvent::new(want_r, token_r);
+        let _ = epoll.modify(&conn.fd_r, &mut ev_r);
+        conn.epoll_flags_r = want_r;
     }
 }
+
+// ── UDP association ──────────────────────────────────────────────────────────
 
 struct UdpAssoc {
-    cli_addr: SockAddr,
-    cli_net_addr: std::net::SocketAddr,
-    up_fd: RawFd,
+    cli_addr: SockaddrStorage,               // address to echo replies to
+    cli_net_addr: Option<std::net::SocketAddr>, // hashmap key (None for exotic AF)
+    up_fd: OwnedFd,                          // connected upstream UDP socket
     last_act: Instant,
-    #[allow(dead_code)] // stored for potential introspection/debugging
-    token: Token,
 }
+
+// ── Slab helpers ─────────────────────────────────────────────────────────────
+
+fn alloc_slot<T>(slab: &mut Vec<Option<T>>, free: &mut VecDeque<usize>, val: T) -> usize {
+    if let Some(idx) = free.pop_front() {
+        slab[idx] = Some(val);
+        idx
+    } else {
+        let idx = slab.len();
+        slab.push(Some(val));
+        idx
+    }
+}
+
+fn free_slot<T>(slab: &mut Vec<Option<T>>, free: &mut VecDeque<usize>, idx: usize) {
+    slab[idx] = None;
+    free.push_back(idx);
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
     let cli = Cli::parse();
@@ -230,25 +235,18 @@ fn main() {
         Config::default()
     };
     cfg.apply_env_overrides();
-    if let Some(ref ip) = cli.local_ip {
-        cfg.local_ip = ip.clone();
-    }
-    if let Some(port) = cli.local_port {
-        cfg.local_port = port;
-    }
-    if let Some(ref ip) = cli.remote_ip {
-        cfg.remote_ip = ip.clone();
-    }
-    if let Some(port) = cli.remote_tcp_port {
-        cfg.remote_tcp_port = port;
-    }
-    if let Some(port) = cli.remote_udp_port {
-        cfg.remote_udp_port = port;
-    }
+    if let Some(ref ip) = cli.local_ip    { cfg.local_ip = ip.clone(); }
+    if let Some(port) = cli.local_port    { cfg.local_port = port; }
+    if let Some(ref ip) = cli.remote_ip   { cfg.remote_ip = ip.clone(); }
+    if let Some(port) = cli.remote_tcp_port { cfg.remote_tcp_port = port; }
+    if let Some(port) = cli.remote_udp_port { cfg.remote_udp_port = port; }
     let cfg = cfg.validate().unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
+
+    // Initialise the new mpsc-backed logger.
+    log::init(cfg.log_enable, cfg.log_rate_per_sec);
 
     log::push(format!(
         "Using config: local={}:{} -> remote={} TCP:{}/UDP:{}",
@@ -256,61 +254,64 @@ fn main() {
     ));
     log::push(format!(
         "Runtime: pool={} refill={} splice={} backlog={} udp_buf={} log={}",
-        cfg.pool_size,
-        cfg.refill_batch,
-        cfg.splice_chunk,
-        cfg.listen_backlog,
-        cfg.udp_socket_buffer,
-        if cfg.log_enable { "on" } else { "off" }
+        cfg.pool_size, cfg.refill_batch, cfg.splice_chunk, cfg.listen_backlog,
+        cfg.udp_socket_buffer, if cfg.log_enable { "on" } else { "off" }
     ));
 
-    // Raise fd limit and ignore SIGPIPE
-    let _ =
-        nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, 65535, 65535);
+    // Raise fd limit and set up signal handlers (#7).
+    let _ = nix::sys::resource::setrlimit(
+        nix::sys::resource::Resource::RLIMIT_NOFILE, 65535, 65535,
+    );
+    let sa_ign = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+    let sa_shut = SigAction::new(
+        SigHandler::Handler(handle_shutdown),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
     unsafe {
-        signal(Signal::SIGPIPE, SigHandler::SigIgn).unwrap();
+        sigaction(Signal::SIGPIPE, &sa_ign).unwrap();
+        sigaction(Signal::SIGTERM, &sa_shut).unwrap();
+        sigaction(Signal::SIGINT, &sa_shut).unwrap();
     }
 
-    let local_addr = sock::resolve(&cfg.local_ip, cfg.local_port, Type::STREAM)
+    let local_addr      = s::resolve(&cfg.local_ip, cfg.local_port, Type::STREAM)
         .expect("failed to resolve LOCAL_IP");
-    let remote_tcp_addr = sock::resolve(&cfg.remote_ip, cfg.remote_tcp_port, Type::STREAM)
+    let remote_tcp_addr = s::resolve(&cfg.remote_ip, cfg.remote_tcp_port, Type::STREAM)
         .expect("failed to resolve REMOTE_TCP");
-    let remote_udp_addr = sock::resolve(&cfg.remote_ip, cfg.remote_udp_port, Type::DGRAM)
+    let remote_udp_addr = s::resolve(&cfg.remote_ip, cfg.remote_udp_port, Type::DGRAM)
         .expect("failed to resolve REMOTE_UDP");
 
     let domain = local_addr.domain();
 
-    // TCP listen
-    let tcp_listen = Socket::new(domain, Type::STREAM, Some(socket2::Protocol::TCP)).unwrap();
-    tcp_listen.set_nonblocking(true).unwrap();
-    tcp_listen.set_reuse_address(true).unwrap();
-    tcp_listen.bind(&local_addr).unwrap();
-    tcp_listen.listen(cfg.listen_backlog).unwrap();
-    let tcp_listen_fd = tcp_listen.into_raw_fd();
+    // TCP listen socket (OwnedFd owns the fd for the program lifetime).
+    let tcp_listen_sock = Socket::new(domain, Type::STREAM, Some(socket2::Protocol::TCP)).unwrap();
+    tcp_listen_sock.set_nonblocking(true).unwrap();
+    tcp_listen_sock.set_reuse_address(true).unwrap();
+    tcp_listen_sock.bind(&local_addr).unwrap();
+    tcp_listen_sock.listen(cfg.listen_backlog).unwrap();
+    let tcp_listen: OwnedFd = unsafe { OwnedFd::from_raw_fd(tcp_listen_sock.into_raw_fd()) };
 
-    // UDP listen
-    let udp_listen = Socket::new(domain, Type::DGRAM, Some(socket2::Protocol::UDP)).unwrap();
-    udp_listen.set_nonblocking(true).unwrap();
-    udp_listen.set_reuse_address(true).unwrap();
-    let _ = udp_listen.set_recv_buffer_size(cfg.udp_socket_buffer);
-    let _ = udp_listen.set_send_buffer_size(cfg.udp_socket_buffer);
-    udp_listen.bind(&local_addr).unwrap();
-    let udp_listen_fd = udp_listen.into_raw_fd();
+    // UDP listen socket.
+    let udp_listen_sock = Socket::new(domain, Type::DGRAM, Some(socket2::Protocol::UDP)).unwrap();
+    udp_listen_sock.set_nonblocking(true).unwrap();
+    udp_listen_sock.set_reuse_address(true).unwrap();
+    let _ = udp_listen_sock.set_recv_buffer_size(cfg.udp_socket_buffer);
+    let _ = udp_listen_sock.set_send_buffer_size(cfg.udp_socket_buffer);
+    udp_listen_sock.bind(&local_addr).unwrap();
+    let udp_listen: OwnedFd = unsafe { OwnedFd::from_raw_fd(udp_listen_sock.into_raw_fd()) };
 
-    // Epoll
-    let mut poll = Poll::new().unwrap();
-    poll.registry()
-        .register(
-            &mut SourceFd(&tcp_listen_fd),
-            TOKEN_ACCEPT,
-            Interest::READABLE,
-        )
-        .unwrap();
-    poll.registry()
-        .register(&mut SourceFd(&udp_listen_fd), TOKEN_UDP, Interest::READABLE)
-        .unwrap();
+    // Epoll instance (#2: raw epoll with ET).
+    let epoll = Epoll::new(EpollCreateFlags::empty()).expect("epoll_create1 failed");
+    epoll.add(
+        tcp_listen.as_fd(),
+        EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, TOKEN_ACCEPT),
+    ).unwrap();
+    epoll.add(
+        udp_listen.as_fd(),
+        EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, TOKEN_UDP),
+    ).unwrap();
 
-    // Preconnection pool
+    // Preconnection pool.
     let pool = Arc::new(Mutex::new(Pool::new(cfg.pool_size)));
     if cfg.pool_size > 0 {
         let cfg_arc = Arc::new(cfg.clone());
@@ -319,504 +320,416 @@ fn main() {
 
     let splice_chunk = cfg.splice_chunk;
 
+    // TCP connection slab: token = slab_idx*2 (local fd) or slab_idx*2+1 (remote fd).
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut free_slots: VecDeque<usize> = VecDeque::new();
 
-    fn alloc_slot(conns: &mut Vec<Option<Conn>>, free: &mut VecDeque<usize>, conn: Conn) -> usize {
-        if let Some(idx) = free.pop_front() {
-            conns[idx] = Some(conn);
-            idx
-        } else {
-            let idx = conns.len();
-            conns.push(Some(conn));
-            idx
-        }
-    }
-
-    fn free_slot(conns: &mut Vec<Option<Conn>>, free: &mut VecDeque<usize>, idx: usize) {
-        conns[idx] = None;
-        free.push_back(idx);
-    }
-
+    // UDP association slab: token = UDP_BASE + slot_idx.
     let mut udp_map: HashMap<std::net::SocketAddr, usize> = HashMap::new();
     let mut udp_slots: Vec<Option<UdpAssoc>> = Vec::new();
     let mut udp_free: VecDeque<usize> = VecDeque::new();
-    let mut events = Events::with_capacity(1024);
+
+    let mut events = vec![EpollEvent::new(EpollFlags::empty(), 0); 1024];
     let mut last_cleanup = Instant::now();
 
+    // ── Event loop ───────────────────────────────────────────────────────────
     loop {
-        poll.poll(&mut events, Some(Duration::from_millis(100)))
-            .unwrap();
+        let n = match epoll.wait(&mut events, EpollTimeout::from(100u16)) {
+            Ok(n) => n,
+            Err(Errno::EINTR) => 0, // interrupted by signal — check SHUTDOWN below
+            Err(e) => {
+                log::push(format!("epoll_wait error: {e}"));
+                break;
+            }
+        };
+
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            log::push("Shutdown signal received, exiting...".into());
+            break;
+        }
+
         let now = Instant::now();
         log::maybe_flush();
 
-        for event in events.iter() {
-            let token = event.token();
+        for i in 0..n {
+            let ev = events[i];
+            let token = ev.data();
+            let ev_flags = ev.events();
 
-            // ── TCP accept ────────────────────────────────────
+            // ── TCP accept ───────────────────────────────────────────────────
             if token == TOKEN_ACCEPT {
                 loop {
-                    match accept4(tcp_listen_fd, SockFlag::SOCK_NONBLOCK) {
+                    match accept4(tcp_listen.as_raw_fd(), SockFlag::SOCK_NONBLOCK) {
                         Ok(cli_fd) => {
-                            // Apply TCP options via socket2
                             let cli_sock = unsafe { Socket::from_raw_fd(cli_fd) };
                             s::set_tcp_options(&cli_sock, &cfg);
-                            let cli_fd = cli_sock.into_raw_fd();
+                            let cli_owned: OwnedFd =
+                                unsafe { OwnedFd::from_raw_fd(cli_sock.into_raw_fd()) };
 
-                            let rem_opt = if cfg.pool_size > 0 {
-                                pool.lock().unwrap().take_live()
+                            // Try to get a pre-connected fd from the pool (#1: mutex-free liveness check).
+                            let pool_fd = if cfg.pool_size > 0 {
+                                pool::take_live_unlocked(&pool)
                             } else {
                                 None
                             };
 
-                            let (rem_fd, connecting) = if let Some(fd) = rem_opt {
-                                (fd, false)
+                            let (rem_owned, connecting) = if let Some(fd) = pool_fd {
+                                (unsafe { OwnedFd::from_raw_fd(fd) }, false)
                             } else {
                                 log::push("Exceeded Connections Pool, Direct Out...".into());
                                 match direct_connect(&remote_tcp_addr, &cfg) {
-                                    Ok(ConnectState::Connected(fd)) => (fd, false),
-                                    Ok(ConnectState::Connecting(fd)) => (fd, true),
-                                    Err(_) => {
-                                        let _ = nix::unistd::close(cli_fd);
-                                        continue;
-                                    }
+                                    Ok(ConnectState::Connected(owned)) => (owned, false),
+                                    Ok(ConnectState::Connecting(owned)) => (owned, true),
+                                    Err(_) => continue,
                                 }
                             };
 
-                            let (pipe_l2r_r, pipe_l2r_w) = make_pipe().unwrap();
-                            let (pipe_r2l_r, pipe_r2l_w) = make_pipe().unwrap();
-                            tune_pipe(pipe_l2r_r.as_raw_fd(), cfg.splice_chunk);
-                            tune_pipe(pipe_l2r_w.as_raw_fd(), cfg.splice_chunk);
-                            tune_pipe(pipe_r2l_r.as_raw_fd(), cfg.splice_chunk);
-                            tune_pipe(pipe_r2l_w.as_raw_fd(), cfg.splice_chunk);
-
-                            let slab_idx = alloc_slot(
-                                &mut conns,
-                                &mut free_slots,
-                                Conn {
-                                    fd_l: cli_fd,
-                                    fd_r: rem_fd,
-                                    pipe_l2r: pipe_l2r_w.into_raw_fd(),
-                                    pipe_l2r_read: pipe_l2r_r.into_raw_fd(),
-                                    pipe_r2l: pipe_r2l_w.into_raw_fd(),
-                                    pipe_r2l_read: pipe_r2l_r.into_raw_fd(),
-                                    len_l2r: 0,
-                                    len_r2l: 0,
-                                    last_l2r: now,
-                                    last_r2l: now,
-                                    eof_l2r: false,
-                                    eof_r2l: false,
-                                    shut_wr_r: false,
-                                    shut_wr_l: false,
-                                    half_close_since: None,
-                                    connecting,
-                                    connect_start: now,
-                                    closed: false,
-                                    interest_l: Interest::READABLE,
-                                    interest_r: if connecting {
-                                        Interest::WRITABLE
-                                    } else {
-                                        Interest::READABLE
-                                    },
-                                },
-                            );
-
-                            let conn = conns[slab_idx].as_ref().unwrap();
-                            let token_l = Token(slab_idx * 2);
-                            let mut src_fd_l = SourceFd(&conn.fd_l);
-                            if poll
-                                .registry()
-                                .register(&mut src_fd_l, token_l, Interest::READABLE)
-                                .is_err()
-                            {
-                                conns[slab_idx] = None;
-                                free_slot(&mut conns, &mut free_slots, slab_idx);
-                                continue;
-                            }
-
-                            let token_r = Token(slab_idx * 2 + 1);
-                            let mut src_fd_r = SourceFd(&conn.fd_r);
-                            let interest = if connecting {
-                                Interest::WRITABLE
-                            } else {
-                                Interest::READABLE
+                            let (pipe_l2r_r, pipe_l2r_w) = match make_pipe() {
+                                Ok(p) => p,
+                                Err(_) => continue,
                             };
-                            if poll
-                                .registry()
-                                .register(&mut src_fd_r, token_r, interest)
-                                .is_err()
-                            {
-                                let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
+                            let (pipe_r2l_r, pipe_r2l_w) = match make_pipe() {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            tune_pipe(pipe_l2r_r.as_fd(), splice_chunk);
+                            tune_pipe(pipe_l2r_w.as_fd(), splice_chunk);
+                            tune_pipe(pipe_r2l_r.as_fd(), splice_chunk);
+                            tune_pipe(pipe_r2l_w.as_fd(), splice_chunk);
+
+                            // Initial epoll registration flags (#2+#3: EPOLLET + EPOLLRDHUP).
+                            // During connect: fd_l gets no EPOLLIN (wait for remote to connect).
+                            let init_flags_l = if connecting {
+                                EpollFlags::EPOLLET | EpollFlags::EPOLLRDHUP
+                            } else {
+                                EpollFlags::EPOLLET | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP
+                            };
+                            let init_flags_r = if connecting {
+                                EpollFlags::EPOLLET | EpollFlags::EPOLLOUT | EpollFlags::EPOLLRDHUP
+                            } else {
+                                EpollFlags::EPOLLET | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP
+                            };
+
+                            let conn = Conn {
+                                fd_l: cli_owned,
+                                fd_r: rem_owned,
+                                pipe_l2r_w,
+                                pipe_l2r_r,
+                                pipe_r2l_w,
+                                pipe_r2l_r,
+                                len_l2r: 0,
+                                len_r2l: 0,
+                                last_l2r: now,
+                                last_r2l: now,
+                                eof_l2r: false,
+                                eof_r2l: false,
+                                shut_wr_r: false,
+                                shut_wr_l: false,
+                                half_close_since: None,
+                                connecting,
+                                connect_start: now,
+                                closed: false,
+                                epoll_flags_l: init_flags_l,
+                                epoll_flags_r: init_flags_r,
+                            };
+                            let slab_idx = alloc_slot(&mut conns, &mut free_slots, conn);
+                            let c = conns[slab_idx].as_ref().unwrap();
+
+                            let token_l = (slab_idx * 2) as u64;
+                            let token_r = (slab_idx * 2 + 1) as u64;
+                            let reg_l = epoll.add(
+                                c.fd_l.as_fd(),
+                                EpollEvent::new(init_flags_l, token_l),
+                            );
+                            let reg_r = epoll.add(
+                                c.fd_r.as_fd(),
+                                EpollEvent::new(init_flags_r, token_r),
+                            );
+                            if reg_l.is_err() || reg_r.is_err() {
                                 conns[slab_idx] = None;
                                 free_slot(&mut conns, &mut free_slots, slab_idx);
-                                continue;
                             }
                         }
-                        Err(Errno::EAGAIN) => break,
+                        Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => break,
                         Err(_) => break,
                     }
                 }
+                continue;
             }
-            // ── UDP listen ────────────────────────────────────
-            else if token == TOKEN_UDP {
+
+            // ── UDP inbound (client → us → upstream) (#4: safe nix wrappers) ──
+            if token == TOKEN_UDP {
                 let mut buf = [0u8; 65535];
                 loop {
-                    let mut cli_addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-                    let mut cli_len: libc::socklen_t =
-                        std::mem::size_of::<libc::sockaddr_storage>() as u32;
-                    let n = unsafe {
-                        libc::recvfrom(
-                            udp_listen_fd,
-                            buf.as_mut_ptr() as *mut libc::c_void,
-                            buf.len(),
-                            0,
-                            &mut cli_addr as *mut _ as *mut libc::sockaddr,
-                            &mut cli_len,
-                        )
-                    };
-                    if n < 0 {
-                        let err = unsafe { *libc::__errno_location() };
-                        if err == libc::EAGAIN {
-                            break;
-                        }
-                        break;
-                    }
-                    let n = n as usize;
+                    match recvfrom::<SockaddrStorage>(udp_listen.as_raw_fd(), &mut buf) {
+                        Ok((n, Some(cli_addr))) => {
+                            let cli_net = s::storage_to_net(&cli_addr);
 
-                    let cli_sock_addr = unsafe {
-                        SockAddr::try_init(|storage, len| {
-                            let ptr =
-                                &cli_addr as *const libc::sockaddr_storage as *const libc::sockaddr;
-                            std::ptr::copy_nonoverlapping(
-                                ptr as *const u8,
-                                storage as *mut u8,
-                                cli_len as usize,
-                            );
-                            *len = cli_len;
-                            Ok(())
-                        })
-                    }
-                    .map(|(_, addr)| addr)
-                    .unwrap();
-
-                    // O(1) lookup via hash map keyed on the client's SocketAddr.
-                    let cli_net = cli_sock_addr.as_socket();
-                    let found_up_fd = if let Some(net_addr) = cli_net {
-                        if let Some(&slot_idx) = udp_map.get(&net_addr) {
-                            udp_slots
-                                .get_mut(slot_idx)
-                                .and_then(|s| s.as_mut())
-                                .map(|a| {
-                                    a.last_act = now;
-                                    a.up_fd
-                                })
-                        } else {
-                            None
-                        }
-                    } else {
-                        // Non-IP address family: fall back to linear scan.
-                        udp_slots
-                            .iter_mut()
-                            .filter_map(|s| s.as_mut())
-                            .find(|a| sock::sockaddr_eq(&a.cli_addr, &cli_sock_addr))
-                            .map(|a| {
-                                a.last_act = now;
-                                a.up_fd
-                            })
-                    };
-
-                    if let Some(up_fd) = found_up_fd {
-                        let _ = send(up_fd, &buf[..n], MsgFlags::MSG_DONTWAIT);
-                    } else {
-                        match sock::create_udp_socket(domain, &cfg) {
-                            Ok(s) => {
-                                let up_fd = s.into_raw_fd();
-                                unsafe {
-                                    libc::connect(
-                                        up_fd,
-                                        remote_udp_addr.as_ptr() as *const libc::sockaddr,
-                                        remote_udp_addr.len(),
-                                    );
-                                }
-                                // Allocate a slot and assign a unique epoll token.
-                                let slot_idx = if let Some(idx) = udp_free.pop_front() {
-                                    idx
+                            // O(1) hashmap lookup for known clients.
+                            let up_fd_raw = if let Some(net) = cli_net {
+                                if let Some(&slot) = udp_map.get(&net) {
+                                    udp_slots.get_mut(slot)
+                                        .and_then(|s| s.as_mut())
+                                        .map(|a| { a.last_act = now; a.up_fd.as_raw_fd() })
                                 } else {
-                                    let idx = udp_slots.len();
-                                    udp_slots.push(None);
-                                    idx
-                                };
-                                let t = Token(UDP_UPSTREAM_BASE + slot_idx);
-                                if poll
-                                    .registry()
-                                    .register(&mut SourceFd(&up_fd), t, Interest::READABLE)
-                                    .is_err()
-                                {
-                                    let _ = nix::unistd::close(up_fd);
-                                    udp_free.push_back(slot_idx);
-                                    continue;
+                                    None
                                 }
-                                let _ = send(up_fd, &buf[..n], MsgFlags::MSG_DONTWAIT);
-                                if let Some(net_addr) = cli_net {
-                                    udp_map.insert(net_addr, slot_idx);
-                                }
-                                let cli_net_addr = cli_net
-                                    .unwrap_or(std::net::SocketAddr::from(([0u8, 0, 0, 0], 0)));
-                                udp_slots[slot_idx] = Some(UdpAssoc {
-                                    cli_addr: cli_sock_addr,
-                                    cli_net_addr,
-                                    up_fd,
-                                    last_act: now,
-                                    token: t,
-                                });
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                }
-            }
-            // ── UDP upstream response / TCP connection event ──
-            else {
-                let raw = usize::from(token);
-                if raw >= (usize::MAX - 10) {
-                    continue;
-                }
-
-                // ── UDP upstream response ─────────────────────
-                if raw >= UDP_UPSTREAM_BASE {
-                    let slot_idx = raw - UDP_UPSTREAM_BASE;
-                    let mut buf = [0u8; 65535];
-                    if let Some(Some(ref mut assoc)) = udp_slots.get_mut(slot_idx) {
-                        loop {
-                            let n = unsafe {
-                                libc::recv(
-                                    assoc.up_fd,
-                                    buf.as_mut_ptr() as *mut libc::c_void,
-                                    buf.len(),
-                                    libc::MSG_DONTWAIT,
-                                )
+                            } else {
+                                // Exotic address family: linear scan.
+                                udp_slots.iter_mut()
+                                    .filter_map(|s| s.as_mut())
+                                    .find(|a| s::nix_storage_eq(&a.cli_addr, &cli_addr))
+                                    .map(|a| { a.last_act = now; a.up_fd.as_raw_fd() })
                             };
-                            if n <= 0 {
-                                break;
-                            }
-                            let n = n as usize;
-                            unsafe {
-                                libc::sendto(
-                                    udp_listen_fd,
-                                    buf.as_ptr() as *const libc::c_void,
-                                    n,
-                                    0,
-                                    assoc.cli_addr.as_ptr() as *const libc::sockaddr,
-                                    assoc.cli_addr.len(),
+
+                            if let Some(fd) = up_fd_raw {
+                                let _ = nix::sys::socket::send(
+                                    fd, &buf[..n], MsgFlags::MSG_DONTWAIT,
                                 );
-                            }
-                            assoc.last_act = now;
-                        }
-                    }
-                    continue;
-                }
-
-                // ── TCP connection event ──────────────────────
-                // Decode token: local = slab_idx*2, remote = slab_idx*2+1
-                let is_remote = (raw & 1) != 0;
-                let idx = raw >> 1;
-                if idx >= conns.len() {
-                    continue;
-                }
-                let conn = match conns.get_mut(idx) {
-                    Some(Some(c)) => c,
-                    _ => continue,
-                };
-                if conn.closed {
-                    continue;
-                }
-
-                // Handle connecting remote
-                if is_remote && conn.connecting {
-                    if event.is_writable() || event.is_error() {
-                        let err = nix::sys::socket::getsockopt(
-                            &bfd(conn.fd_r),
-                            nix::sys::socket::sockopt::SocketError,
-                        );
-                        if err != Ok(0) {
-                            log::push("Connect failed".into());
-                            let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
-                            let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_r));
-                            conns[idx] = None;
-                            free_slot(&mut conns, &mut free_slots, idx);
-                            continue;
-                        }
-                        conn.connecting = false;
-                        conn_watch(conn, poll.registry(), idx);
-                    }
-                    continue;
-                }
-
-                if event.is_error() {
-                    log::push(format!(
-                        "Connection Error: {}",
-                        if is_remote { "Remote" } else { "Local" }
-                    ));
-                    let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
-                    let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_r));
-                    conns[idx] = None;
-                    free_slot(&mut conns, &mut free_slots, idx);
-                    continue;
-                }
-
-                // Pump local → remote
-                if !conn.eof_l2r {
-                    let res = pump(
-                        conn.fd_l,
-                        conn.fd_r,
-                        conn.pipe_l2r,
-                        conn.pipe_l2r_read,
-                        &mut conn.len_l2r,
-                        splice_chunk,
-                        now,
-                        &mut conn.last_l2r,
-                    );
-                    match res {
-                        PumpStatus::Err => {
-                            log::push("Connection Error: Local->Remote".into());
-                            let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
-                            let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_r));
-                            conns[idx] = None;
-                            free_slot(&mut conns, &mut free_slots, idx);
-                            continue;
-                        }
-                        PumpStatus::Eof => {
-                            conn.eof_l2r = true;
-                            if !conn.eof_r2l && conn.half_close_since.is_none() {
-                                conn.half_close_since = Some(now);
-                            } else if conn.eof_r2l {
-                                conn.half_close_since = None;
-                            }
-                            log::push("EOF: Local->Remote".into());
-                        }
-                        PumpStatus::Ok => {}
-                    }
-                } else if conn.len_l2r > 0 {
-                    let mut drain_err = false;
-                    let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
-                    while conn.len_l2r > 0 {
-                        match splice(
-                            bfd(conn.pipe_l2r_read),
-                            None,
-                            bfd(conn.fd_r),
-                            None,
-                            conn.len_l2r,
-                            flags,
-                        ) {
-                            Ok(n) if n > 0 => {
-                                conn.len_l2r -= n;
-                                conn.last_l2r = now;
-                            }
-                            Err(Errno::EAGAIN) => break,
-                            _ => {
-                                drain_err = true;
-                                break;
+                            } else {
+                                // New client — create a connected upstream UDP socket.
+                                match s::create_udp_socket(domain, &cfg) {
+                                    Ok(up_sock) => {
+                                        // socket2::connect is safe (#4).
+                                        let _ = up_sock.connect(&remote_udp_addr);
+                                        let up_owned = unsafe {
+                                            OwnedFd::from_raw_fd(up_sock.into_raw_fd())
+                                        };
+                                        let slot_idx = if let Some(idx) = udp_free.pop_front() {
+                                            idx
+                                        } else {
+                                            let idx = udp_slots.len();
+                                            udp_slots.push(None);
+                                            idx
+                                        };
+                                        let t = UDP_BASE + slot_idx as u64;
+                                        if epoll.add(
+                                            up_owned.as_fd(),
+                                            EpollEvent::new(
+                                                EpollFlags::EPOLLIN | EpollFlags::EPOLLET, t,
+                                            ),
+                                        ).is_ok() {
+                                            let _ = nix::sys::socket::send(
+                                                up_owned.as_raw_fd(),
+                                                &buf[..n],
+                                                MsgFlags::MSG_DONTWAIT,
+                                            );
+                                            if let Some(net) = cli_net {
+                                                udp_map.insert(net, slot_idx);
+                                            }
+                                            udp_slots[slot_idx] = Some(UdpAssoc {
+                                                cli_addr,
+                                                cli_net_addr: cli_net,
+                                                up_fd: up_owned,
+                                                last_act: now,
+                                            });
+                                        } else {
+                                            udp_free.push_back(slot_idx);
+                                        }
+                                    }
+                                    Err(_) => {}
+                                }
                             }
                         }
-                    }
-                    if drain_err {
-                        let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
-                        let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_r));
-                        conns[idx] = None;
-                        free_slot(&mut conns, &mut free_slots, idx);
-                        continue;
+                        Ok((_, None)) => {} // no address returned
+                        Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => break,
+                        Err(_) => break,
                     }
                 }
-
-                if conn.eof_l2r && conn.len_l2r == 0 && !conn.shut_wr_r {
-                    s::shutdown_write(conn.fd_r);
-                    conn.shut_wr_r = true;
-                }
-
-                // Pump remote → local
-                if !conn.eof_r2l {
-                    let res = pump(
-                        conn.fd_r,
-                        conn.fd_l,
-                        conn.pipe_r2l,
-                        conn.pipe_r2l_read,
-                        &mut conn.len_r2l,
-                        splice_chunk,
-                        now,
-                        &mut conn.last_r2l,
-                    );
-                    match res {
-                        PumpStatus::Err => {
-                            log::push("Connection Error: Remote->Local".into());
-                            let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
-                            let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_r));
-                            conns[idx] = None;
-                            free_slot(&mut conns, &mut free_slots, idx);
-                            continue;
-                        }
-                        PumpStatus::Eof => {
-                            conn.eof_r2l = true;
-                            if !conn.eof_l2r && conn.half_close_since.is_none() {
-                                conn.half_close_since = Some(now);
-                            } else if conn.eof_l2r {
-                                conn.half_close_since = None;
-                            }
-                            log::push("EOF: Remote->Local".into());
-                        }
-                        PumpStatus::Ok => {}
-                    }
-                } else if conn.len_r2l > 0 {
-                    let mut drain_err = false;
-                    let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
-                    while conn.len_r2l > 0 {
-                        match splice(
-                            bfd(conn.pipe_r2l_read),
-                            None,
-                            bfd(conn.fd_l),
-                            None,
-                            conn.len_r2l,
-                            flags,
-                        ) {
-                            Ok(n) if n > 0 => {
-                                conn.len_r2l -= n;
-                                conn.last_r2l = now;
-                            }
-                            Err(Errno::EAGAIN) => break,
-                            _ => {
-                                drain_err = true;
-                                break;
-                            }
-                        }
-                    }
-                    if drain_err {
-                        let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
-                        let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_r));
-                        conns[idx] = None;
-                        free_slot(&mut conns, &mut free_slots, idx);
-                        continue;
-                    }
-                }
-
-                if conn.eof_r2l && conn.len_r2l == 0 && !conn.shut_wr_l {
-                    s::shutdown_write(conn.fd_l);
-                    conn.shut_wr_l = true;
-                }
-
-                if conn.eof_l2r && conn.eof_r2l && conn.len_l2r == 0 && conn.len_r2l == 0 {
-                    log::push("Connection Fully Closed".into());
-                    let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
-                    let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_r));
-                    conns[idx] = None;
-                    free_slot(&mut conns, &mut free_slots, idx);
-                    continue;
-                }
-
-                conn_watch(conn, poll.registry(), idx);
+                continue;
             }
+
+            // ── UDP upstream response (upstream → us → client) ────────────────
+            if token >= UDP_BASE && token < TOKEN_UDP - 1 {
+                let slot_idx = (token - UDP_BASE) as usize;
+                let mut buf = [0u8; 65535];
+                if let Some(Some(ref mut assoc)) = udp_slots.get_mut(slot_idx) {
+                    let up_raw = assoc.up_fd.as_raw_fd();
+                    loop {
+                        // nix::sys::socket::recv is safe (#4).
+                        match nix::sys::socket::recv(
+                            up_raw, &mut buf, MsgFlags::MSG_DONTWAIT,
+                        ) {
+                            Ok(n) if n > 0 => {
+                                // sendto with nix — no unsafe (#4).
+                                let _ = sendto(
+                                    udp_listen.as_raw_fd(),
+                                    &buf[..n],
+                                    &assoc.cli_addr,
+                                    MsgFlags::MSG_DONTWAIT,
+                                );
+                                assoc.last_act = now;
+                            }
+                            Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => break,
+                            _ => break,
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // ── TCP connection event ──────────────────────────────────────────
+            let raw = token as usize;
+            let is_remote = (raw & 1) != 0;
+            let idx = raw >> 1;
+            let conn = match conns.get_mut(idx) {
+                Some(Some(c)) => c,
+                _ => continue,
+            };
+            if conn.closed {
+                continue;
+            }
+
+            // Handle in-progress connect completing on fd_r.
+            if is_remote && conn.connecting {
+                if ev_flags.intersects(
+                    EpollFlags::EPOLLOUT | EpollFlags::EPOLLERR |
+                    EpollFlags::EPOLLHUP | EpollFlags::EPOLLRDHUP,
+                ) {
+                    let err = nix::sys::socket::getsockopt(
+                        &conn.fd_r,
+                        nix::sys::socket::sockopt::SocketError,
+                    );
+                    if err != Ok(0) {
+                        log::push("Connect failed".into());
+                        conns[idx] = None;
+                        free_slot(&mut conns, &mut free_slots, idx);
+                        continue;
+                    }
+                    conn.connecting = false;
+                    conn_watch(conn, &epoll, idx);
+                }
+                continue;
+            }
+
+            // Immediate close on EPOLLERR (matches C version behaviour).
+            if ev_flags.contains(EpollFlags::EPOLLERR) {
+                log::push(format!(
+                    "Connection Error: {}", if is_remote { "Remote" } else { "Local" }
+                ));
+                conns[idx] = None;
+                free_slot(&mut conns, &mut free_slots, idx);
+                continue;
+            }
+
+            // EPOLLRDHUP/EPOLLIN/EPOLLOUT: pump() detects EOF from splice()==0.
+            // EPOLLRDHUP gives us instant half-close detection (#3).
+
+            // ── Pump local → remote ──
+            if !conn.eof_l2r {
+                let res = pump(
+                    conn.fd_l.as_fd(), conn.fd_r.as_fd(),
+                    conn.pipe_l2r_w.as_fd(), conn.pipe_l2r_r.as_fd(),
+                    &mut conn.len_l2r, splice_chunk, now, &mut conn.last_l2r,
+                );
+                match res {
+                    PumpStatus::Err => {
+                        log::push("Connection Error: Local->Remote".into());
+                        conns[idx] = None;
+                        free_slot(&mut conns, &mut free_slots, idx);
+                        continue;
+                    }
+                    PumpStatus::Eof => {
+                        conn.eof_l2r = true;
+                        if !conn.eof_r2l && conn.half_close_since.is_none() {
+                            conn.half_close_since = Some(now);
+                        } else if conn.eof_r2l {
+                            conn.half_close_since = None;
+                        }
+                        log::push("EOF: Local->Remote".into());
+                    }
+                    PumpStatus::Ok => {}
+                }
+            } else if conn.len_l2r > 0 {
+                // Drain residual pipe data after EOF.
+                let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
+                let mut drain_err = false;
+                while conn.len_l2r > 0 {
+                    match splice(
+                        conn.pipe_l2r_r.as_fd(), None,
+                        conn.fd_r.as_fd(), None,
+                        conn.len_l2r, flags,
+                    ) {
+                        Ok(n) if n > 0 => { conn.len_l2r -= n; conn.last_l2r = now; }
+                        Err(Errno::EAGAIN) => break,
+                        _ => { drain_err = true; break; }
+                    }
+                }
+                if drain_err {
+                    conns[idx] = None;
+                    free_slot(&mut conns, &mut free_slots, idx);
+                    continue;
+                }
+            }
+
+            if conn.eof_l2r && conn.len_l2r == 0 && !conn.shut_wr_r {
+                s::shutdown_write(conn.fd_r.as_raw_fd());
+                conn.shut_wr_r = true;
+            }
+
+            // ── Pump remote → local ──
+            if !conn.eof_r2l {
+                let res = pump(
+                    conn.fd_r.as_fd(), conn.fd_l.as_fd(),
+                    conn.pipe_r2l_w.as_fd(), conn.pipe_r2l_r.as_fd(),
+                    &mut conn.len_r2l, splice_chunk, now, &mut conn.last_r2l,
+                );
+                match res {
+                    PumpStatus::Err => {
+                        log::push("Connection Error: Remote->Local".into());
+                        conns[idx] = None;
+                        free_slot(&mut conns, &mut free_slots, idx);
+                        continue;
+                    }
+                    PumpStatus::Eof => {
+                        conn.eof_r2l = true;
+                        if !conn.eof_l2r && conn.half_close_since.is_none() {
+                            conn.half_close_since = Some(now);
+                        } else if conn.eof_l2r {
+                            conn.half_close_since = None;
+                        }
+                        log::push("EOF: Remote->Local".into());
+                    }
+                    PumpStatus::Ok => {}
+                }
+            } else if conn.len_r2l > 0 {
+                let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
+                let mut drain_err = false;
+                while conn.len_r2l > 0 {
+                    match splice(
+                        conn.pipe_r2l_r.as_fd(), None,
+                        conn.fd_l.as_fd(), None,
+                        conn.len_r2l, flags,
+                    ) {
+                        Ok(n) if n > 0 => { conn.len_r2l -= n; conn.last_r2l = now; }
+                        Err(Errno::EAGAIN) => break,
+                        _ => { drain_err = true; break; }
+                    }
+                }
+                if drain_err {
+                    conns[idx] = None;
+                    free_slot(&mut conns, &mut free_slots, idx);
+                    continue;
+                }
+            }
+
+            if conn.eof_r2l && conn.len_r2l == 0 && !conn.shut_wr_l {
+                s::shutdown_write(conn.fd_l.as_raw_fd());
+                conn.shut_wr_l = true;
+            }
+
+            if conn.eof_l2r && conn.eof_r2l && conn.len_l2r == 0 && conn.len_r2l == 0 {
+                log::push("Connection Fully Closed".into());
+                conns[idx] = None;
+                free_slot(&mut conns, &mut free_slots, idx);
+                continue;
+            }
+
+            conn_watch(conn, &epoll, idx);
         }
 
-        // Periodic cleanup (1 Hz)
-        if now - last_cleanup > Duration::from_secs(1) {
+        // ── Periodic cleanup (1 Hz) ──────────────────────────────────────────
+        if now.duration_since(last_cleanup) > Duration::from_secs(1) {
             last_cleanup = now;
 
             let mut i = 0;
@@ -825,21 +738,22 @@ fn main() {
                     if conn.closed {
                         true
                     } else if conn.connecting
-                        && now - conn.connect_start > Duration::from_secs(cfg.connect_timeout)
+                        && now.duration_since(conn.connect_start)
+                            > Duration::from_secs(cfg.connect_timeout)
                     {
                         log::push("Connect timeout".into());
                         true
                     } else if !conn.connecting {
                         let last = conn.last_l2r.max(conn.last_r2l);
-                        if now - last > Duration::from_secs(cfg.idle_timeout) {
+                        if now.duration_since(last) > Duration::from_secs(cfg.idle_timeout) {
                             log::push(format!("Timeout({}s): Local->Remote", cfg.idle_timeout));
                             log::push(format!("Timeout({}s): Remote->Local", cfg.idle_timeout));
                             true
                         } else if let Some(hs) = conn.half_close_since {
-                            if now - hs > Duration::from_secs(cfg.half_close_timeout) {
+                            if now.duration_since(hs) > Duration::from_secs(cfg.half_close_timeout)
+                            {
                                 log::push(format!(
-                                    "Half-close timeout({}s)",
-                                    cfg.half_close_timeout
+                                    "Half-close timeout({}s)", cfg.half_close_timeout
                                 ));
                                 true
                             } else {
@@ -856,10 +770,7 @@ fn main() {
                 };
 
                 if should_remove {
-                    if let Some(Some(conn)) = conns.get(i) {
-                        let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_l));
-                        let _ = poll.registry().deregister(&mut SourceFd(&conn.fd_r));
-                    }
+                    // OwnedFd Drop closes the fds; epoll auto-removes closed fds on Linux.
                     conns[i] = None;
                     free_slot(&mut conns, &mut free_slots, i);
                     continue;
@@ -867,49 +778,59 @@ fn main() {
                 i += 1;
             }
 
-            for (slot_idx, slot) in udp_slots.iter_mut().enumerate() {
-                if let Some(ref assoc) = *slot {
-                    if now - assoc.last_act > Duration::from_secs(cfg.udp_idle_timeout) {
-                        let up_fd = assoc.up_fd;
-                        let net_addr = assoc.cli_net_addr;
-                        let _ = poll.registry().deregister(&mut SourceFd(&up_fd));
-                        let _ = nix::unistd::close(up_fd);
-                        udp_map.remove(&net_addr);
-                        *slot = None;
-                        udp_free.push_back(slot_idx);
+            for slot_idx in 0..udp_slots.len() {
+                let expired = if let Some(ref a) = udp_slots[slot_idx] {
+                    now.duration_since(a.last_act) > Duration::from_secs(cfg.udp_idle_timeout)
+                } else {
+                    false
+                };
+                if expired {
+                    if let Some(ref a) = udp_slots[slot_idx] {
+                        let _ = epoll.delete(a.up_fd.as_fd());
+                        if let Some(net) = a.cli_net_addr {
+                            udp_map.remove(&net);
+                        }
                     }
+                    udp_slots[slot_idx] = None; // OwnedFd drops → fd closed
+                    udp_free.push_back(slot_idx);
                 }
             }
         }
     }
+
+    // ── Graceful shutdown (#7): flush log and let local variables drop ────────
+    log::flush_all();
+    // All OwnedFds (conns, udp_slots, tcp_listen, udp_listen, epoll) close on drop.
 }
 
+// ── Direct (non-pool) connect ────────────────────────────────────────────────
+
 enum ConnectState {
-    Connected(RawFd),
-    Connecting(RawFd),
+    Connected(OwnedFd),
+    Connecting(OwnedFd),
 }
 
 fn direct_connect(addr: &SockAddr, cfg: &Config) -> Result<ConnectState, ()> {
-    let sock = sock::create_tcp_socket(addr.domain(), cfg, None).map_err(|_| ())?;
-    let fd = sock.into_raw_fd();
+    let sock = s::create_tcp_socket(addr.domain(), cfg, None).map_err(|_| ())?;
+    let owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(sock.into_raw_fd()) };
+
     let nix_addr = unsafe {
-        SockaddrStorage::from_raw(addr.as_ptr() as *const libc::sockaddr, Some(addr.len()))
+        nix::sys::socket::SockaddrStorage::from_raw(
+            addr.as_ptr() as *const libc::sockaddr,
+            Some(addr.len()),
+        )
     };
     match nix_addr {
-        Some(na) => match connect(fd, &na) {
-            Ok(()) => Ok(ConnectState::Connected(fd)),
-            Err(Errno::EINPROGRESS) => Ok(ConnectState::Connecting(fd)),
-            Err(_) => {
-                let _ = nix::unistd::close(fd);
-                Err(())
-            }
+        Some(na) => match connect(owned.as_raw_fd(), &na) {
+            Ok(()) => Ok(ConnectState::Connected(owned)),
+            Err(Errno::EINPROGRESS) => Ok(ConnectState::Connecting(owned)),
+            Err(_) => Err(()), // owned drops → fd closed
         },
-        None => {
-            let _ = nix::unistd::close(fd);
-            Err(())
-        }
+        None => Err(()),
     }
 }
+
+// ── Pipe helpers ─────────────────────────────────────────────────────────────
 
 fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     use nix::fcntl::OFlag;
@@ -917,7 +838,7 @@ fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
 }
 
-fn tune_pipe(fd: RawFd, splice_chunk: usize) {
+fn tune_pipe(fd: BorrowedFd<'_>, splice_chunk: usize) {
     let size = splice_chunk.clamp(16 * 1024, 256 * 1024) as i32;
-    let _ = nix::fcntl::fcntl(bfd(fd), FcntlArg::F_SETPIPE_SZ(size));
+    let _ = nix::fcntl::fcntl(fd, FcntlArg::F_SETPIPE_SZ(size));
 }

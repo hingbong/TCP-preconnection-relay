@@ -156,3 +156,49 @@ pub fn sockaddr_eq(a: &SockAddr, b: &SockAddr) -> bool {
 pub fn shutdown_write(fd: RawFd) {
     let _ = nix::sys::socket::shutdown(fd, nix::sys::socket::Shutdown::Write);
 }
+
+/// Convert a nix `SockaddrStorage` to a `std::net::SocketAddr` (IPv4 or IPv6).
+/// Returns `None` for unsupported address families.
+pub fn storage_to_net(
+    addr: &nix::sys::socket::SockaddrStorage,
+) -> Option<std::net::SocketAddr> {
+    if let Some(v4) = addr.as_sockaddr_in() {
+        let raw = v4.as_ref();
+        // sin_addr.s_addr is stored in network byte order (big-endian).
+        // to_ne_bytes() on a little-endian machine converts 0x0101A8C0 →
+        // [0xC0, 0xA8, 0x01, 0x01] = 192.168.1.1 octets.  On a big-endian
+        // machine it works equally since native == network byte order.
+        let ip = std::net::Ipv4Addr::from(raw.sin_addr.s_addr.to_ne_bytes());
+        let port = u16::from_be(raw.sin_port);
+        Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port))
+    } else if let Some(v6) = addr.as_sockaddr_in6() {
+        let raw = v6.as_ref();
+        // s6_addr is a [u8; 16] byte array — already in the right byte order.
+        let ip = std::net::Ipv6Addr::from(raw.sin6_addr.s6_addr);
+        let port = u16::from_be(raw.sin6_port);
+        Some(std::net::SocketAddr::new(std::net::IpAddr::V6(ip), port))
+    } else {
+        None
+    }
+}
+
+/// Byte-level equality for two `SockaddrStorage` values.
+/// Used as a fallback for address families that don't map to `SocketAddr`.
+pub fn nix_storage_eq(
+    a: &nix::sys::socket::SockaddrStorage,
+    b: &nix::sys::socket::SockaddrStorage,
+) -> bool {
+    use nix::sys::socket::SockaddrLike;
+    let la = a.len() as usize;
+    let lb = b.len() as usize;
+    if la != lb {
+        return false;
+    }
+    unsafe {
+        libc::memcmp(
+            a.as_ptr() as *const libc::c_void,
+            b.as_ptr() as *const libc::c_void,
+            la,
+        ) == 0
+    }
+}

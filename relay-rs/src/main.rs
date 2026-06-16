@@ -476,7 +476,16 @@ fn main() {
                                 EpollFlags::EPOLLET | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP
                             };
                             let init_flags_r = if connecting {
-                                EpollFlags::EPOLLET | EpollFlags::EPOLLOUT | EpollFlags::EPOLLRDHUP
+                                // LT mode for initial connect: EPOLLET is deliberately
+                                // omitted.  The TCP handshake can complete between the
+                                // non-blocking connect() and epoll_ctl(ADD); with ET the
+                                // edge is missed and EPOLLOUT never fires.  LT delivers
+                                // EPOLLOUT continuously until the handler sets
+                                // connecting=false and conn_watch() switches back to ET.
+                                EpollFlags::EPOLLOUT
+                                    | EpollFlags::EPOLLRDHUP
+                                    | EpollFlags::EPOLLERR
+                                    | EpollFlags::EPOLLHUP
                             } else {
                                 EpollFlags::EPOLLET | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP
                             };
@@ -521,6 +530,33 @@ fn main() {
                                     .is_err()
                             {
                                 free_slot(&mut conns, &mut free_slots, slab_idx);
+                            } else if connecting {
+                                // Catch fast connect completion that happens between
+                                // connect() returning EINPROGRESS and epoll_ctl(ADD).
+                                // On local connections the TCP handshake can complete
+                                // before epoll registers the fd; EPOLLET only fires on
+                                // state transitions, so the edge is missed and EPOLLOUT
+                                // never fires — the connection would stall until the
+                                // connect_timeout cleanup fires 5 seconds later.
+                                use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+                                let conn = conns[slab_idx].as_mut().unwrap();
+                                let mut pfd = [PollFd::new(
+                                    conn.fd_r.as_fd(),
+                                    PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP,
+                                )];
+                                if let Ok(1) = poll(&mut pfd, PollTimeout::ZERO) {
+                                    let err = nix::sys::socket::getsockopt(
+                                        &conn.fd_r,
+                                        nix::sys::socket::sockopt::SocketError,
+                                    );
+                                    if err == Ok(0) {
+                                        conn.connecting = false;
+                                        conn_watch(conn, &epoll, slab_idx, splice_chunk);
+                                    } else {
+                                        log::push("Connect failed (post-ADD)".into());
+                                        free_slot(&mut conns, &mut free_slots, slab_idx);
+                                    }
+                                }
                             }
                         }
                         Err(_) => break,
@@ -618,29 +654,36 @@ fn main() {
             }
 
             // ── UDP upstream response (upstream → us → client) ────────────────
-            if token >= UDP_BASE && token < TOKEN_UDP - 1 {
+            // Guard: only consume the event when slot_idx is a valid index
+            // into udp_slots.  Without this guard, TCP connection tokens with
+            // gen >= 1 fall into the [UDP_BASE, TOKEN_UDP) numerical range
+            // (UDP_BASE=1<<26, TCP tokens start at 1<<48) and are silently
+            // dropped by the empty-slot continue on the very next line.
+            if token >= UDP_BASE {
                 let slot_idx = (token - UDP_BASE) as usize;
-                let mut buf = [0u8; 65535];
-                if let Some(Some(ref mut assoc)) = udp_slots.get_mut(slot_idx) {
-                    let up_raw = assoc.up_fd.as_raw_fd();
-                    loop {
-                        // nix::sys::socket::recv is safe (#4).
-                        match nix::sys::socket::recv(up_raw, &mut buf, MsgFlags::MSG_DONTWAIT) {
-                            Ok(n) if n > 0 => {
-                                // sendto with nix — no unsafe (#4).
-                                let _ = sendto(
-                                    udp_listen.as_raw_fd(),
-                                    &buf[..n],
-                                    &assoc.cli_addr,
-                                    MsgFlags::MSG_DONTWAIT,
-                                );
-                                assoc.last_act = now;
+                if slot_idx < udp_slots.len() {
+                    let mut buf = [0u8; 65535];
+                    if let Some(Some(ref mut assoc)) = udp_slots.get_mut(slot_idx) {
+                        let up_raw = assoc.up_fd.as_raw_fd();
+                        loop {
+                            // nix::sys::socket::recv is safe (#4).
+                            match nix::sys::socket::recv(up_raw, &mut buf, MsgFlags::MSG_DONTWAIT) {
+                                Ok(n) if n > 0 => {
+                                    // sendto with nix — no unsafe (#4).
+                                    let _ = sendto(
+                                        udp_listen.as_raw_fd(),
+                                        &buf[..n],
+                                        &assoc.cli_addr,
+                                        MsgFlags::MSG_DONTWAIT,
+                                    );
+                                    assoc.last_act = now;
+                                }
+                                _ => break,
                             }
-                            _ => break,
                         }
                     }
+                    continue;
                 }
-                continue;
             }
 
             // ── TCP connection event ──────────────────────────────────────────

@@ -12,11 +12,12 @@ jobs:
       matrix:
         target:
           - cpu: x86-64-v2
-            features: +sse3,+ssse3,+sse4.1,+sse4.2,+popcnt
             suffix: amd64-v2
           - cpu: x86-64-v3
-            features: +avx,+avx2,+bmi1,+bmi2,+f16c,+fma,+lzcnt,+movbe,+sse3,+ssse3,+sse4.1,+sse4.2,+popcnt
             suffix: amd64-v3
+          - cpu: x86-64-v4
+            suffix: amd64-v4
+
 
     runs-on: ubuntu-latest
     steps:
@@ -38,13 +39,13 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ matrix.target.suffix }}-${{ hashFiles('relay-rs/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-${{ matrix.target.suffix }}-
 
+
       - name: Build relay
         working-directory: relay-rs
         env:
-          RUSTFLAGS: "-C target-cpu=${{ matrix.target.cpu }} -C target-feature=${{ matrix.target.features }}"
+          RUSTFLAGS: "-C target-cpu=${{ matrix.target.cpu }}"
         run: |
           cargo build --release --target x86_64-unknown-linux-musl
-          # Strip and rename
           strip target/x86_64-unknown-linux-musl/release/relay
           cp target/x86_64-unknown-linux-musl/release/relay ../relay-${{ matrix.target.suffix }}
 

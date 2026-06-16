@@ -91,35 +91,53 @@ fn pump(
     let mut got_eof = false;
     let flags = SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_NONBLOCK;
 
-    while *pipe_len < splice_chunk {
-        let remain = splice_chunk - *pipe_len;
-        match splice(src, None, pipe_w, None, remain, flags) {
-            Ok(n) if n > 0 => {
-                *pipe_len += n;
-                *last_ts = now;
-                if *pipe_len >= splice_chunk {
+    // ET mode: loop until src hits EAGAIN so no buffered data is left unread.
+    // A single splice_chunk may be smaller than what is already in the socket
+    // buffer; without this loop the connection would stall until new data
+    // arrives (which would never trigger another edge in ET).
+    loop {
+        let mut src_eagain = false;
+
+        // Fill pipe from src until full or EAGAIN/EOF.
+        while *pipe_len < splice_chunk {
+            let remain = splice_chunk - *pipe_len;
+            match splice(src, None, pipe_w, None, remain, flags) {
+                Ok(n) if n > 0 => {
+                    *pipe_len += n;
+                    *last_ts = now;
+                }
+                Ok(_) => {
+                    got_eof = true;
                     break;
                 }
+                Err(Errno::EAGAIN) => {
+                    src_eagain = true;
+                    break;
+                }
+                Err(_) => return PumpStatus::Err,
             }
-            Ok(_) => {
-                got_eof = true;
-                break;
-            }
-            Err(Errno::EAGAIN) => break,
-            Err(_) => return PumpStatus::Err,
         }
-    }
 
-    while *pipe_len > 0 {
-        match splice(pipe_r, None, dst, None, *pipe_len, flags) {
-            Ok(n) if n > 0 => {
-                *pipe_len -= n;
-                *last_ts = now;
+        // Drain pipe to dst.
+        while *pipe_len > 0 {
+            match splice(pipe_r, None, dst, None, *pipe_len, flags) {
+                Ok(n) if n > 0 => {
+                    *pipe_len -= n;
+                    *last_ts = now;
+                }
+                Err(Errno::EAGAIN) => break,
+                Err(_) => return PumpStatus::Err,
+                Ok(_) => {}
             }
-            Err(Errno::EAGAIN) => break,
-            Err(_) => return PumpStatus::Err,
-            Ok(_) => {}
         }
+
+        // Stop when: EOF received, dst is congested (pipe still has data),
+        // or src returned EAGAIN (socket buffer fully drained).
+        if got_eof || *pipe_len > 0 || src_eagain {
+            break;
+        }
+        // pipe is empty and src did not hit EAGAIN: a full splice_chunk was
+        // consumed and dst accepted it all — src likely has more data, loop.
     }
 
     if got_eof { PumpStatus::Eof } else { PumpStatus::Ok }
@@ -149,14 +167,15 @@ struct Conn {
     connecting: bool,
     connect_start: Instant,
     closed: bool,
-    // Cached epoll interest masks so we only call epoll_ctl(MOD) when they change.
-    epoll_flags_l: EpollFlags,
-    epoll_flags_r: EpollFlags,
 }
 
 /// Re-arm both fds with the correct EPOLLET + EPOLLRDHUP flags (#2 + #3).
-/// Only calls epoll_ctl(MOD) when the desired mask has actually changed,
-/// matching the C version's conn_watch() optimisation.
+///
+/// ET mode requires unconditional epoll_ctl(MOD) on every event: the kernel
+/// re-checks the fd state and will fire immediately if data is already
+/// buffered. Skipping MOD when flags are unchanged is safe in LT but fatal
+/// in ET — any data left in the socket buffer after a partial read would
+/// never produce another edge, stalling the connection.
 fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize) {
     if conn.closed {
         return;
@@ -182,16 +201,12 @@ fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize) {
         want_r |= EpollFlags::EPOLLOUT;
     }
 
-    if want_l != conn.epoll_flags_l {
-        let mut ev_l = EpollEvent::new(want_l, token_l);
-        let _ = epoll.modify(&conn.fd_l, &mut ev_l);
-        conn.epoll_flags_l = want_l;
-    }
-    if want_r != conn.epoll_flags_r {
-        let mut ev_r = EpollEvent::new(want_r, token_r);
-        let _ = epoll.modify(&conn.fd_r, &mut ev_r);
-        conn.epoll_flags_r = want_r;
-    }
+    // Always MOD — this is the ET re-arm. Cost: ~2 syscalls (~400 ns) per
+    // connection event, completely negligible compared to data throughput.
+    let mut ev_l = EpollEvent::new(want_l, token_l);
+    let _ = epoll.modify(&conn.fd_l, &mut ev_l);
+    let mut ev_r = EpollEvent::new(want_r, token_r);
+    let _ = epoll.modify(&conn.fd_r, &mut ev_r);
 }
 
 // ── UDP association ──────────────────────────────────────────────────────────
@@ -429,8 +444,6 @@ fn main() {
                                 connecting,
                                 connect_start: now,
                                 closed: false,
-                                epoll_flags_l: init_flags_l,
-                                epoll_flags_r: init_flags_r,
                             };
                             let slab_idx = alloc_slot(&mut conns, &mut free_slots, conn);
                             let c = conns[slab_idx].as_ref().unwrap();

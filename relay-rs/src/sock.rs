@@ -160,9 +160,7 @@ pub fn shutdown_write(fd: RawFd) {
 
 /// Convert a nix `SockaddrStorage` to a `std::net::SocketAddr` (IPv4 or IPv6).
 /// Returns `None` for unsupported address families.
-pub fn storage_to_net(
-    addr: &nix::sys::socket::SockaddrStorage,
-) -> Option<std::net::SocketAddr> {
+pub fn storage_to_net(addr: &nix::sys::socket::SockaddrStorage) -> Option<std::net::SocketAddr> {
     if let Some(v4) = addr.as_sockaddr_in() {
         let raw = v4.as_ref();
         // sin_addr.s_addr is stored in network byte order (big-endian).

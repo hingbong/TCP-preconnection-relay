@@ -140,7 +140,11 @@ fn pump(
         // consumed and dst accepted it all — src likely has more data, loop.
     }
 
-    if got_eof { PumpStatus::Eof } else { PumpStatus::Ok }
+    if got_eof {
+        PumpStatus::Eof
+    } else {
+        PumpStatus::Ok
+    }
 }
 
 // ── TCP connection state ─────────────────────────────────────────────────────
@@ -226,9 +230,9 @@ fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize, splice_chunk: usi
 // ── UDP association ──────────────────────────────────────────────────────────
 
 struct UdpAssoc {
-    cli_addr: SockaddrStorage,               // address to echo replies to
+    cli_addr: SockaddrStorage,                  // address to echo replies to
     cli_net_addr: Option<std::net::SocketAddr>, // hashmap key (None for exotic AF)
-    up_fd: OwnedFd,                          // connected upstream UDP socket
+    up_fd: OwnedFd,                             // connected upstream UDP socket
     last_act: Instant,
 }
 
@@ -264,11 +268,21 @@ fn main() {
         Config::default()
     };
     cfg.apply_env_overrides();
-    if let Some(ref ip) = cli.local_ip    { cfg.local_ip = ip.clone(); }
-    if let Some(port) = cli.local_port    { cfg.local_port = port; }
-    if let Some(ref ip) = cli.remote_ip   { cfg.remote_ip = ip.clone(); }
-    if let Some(port) = cli.remote_tcp_port { cfg.remote_tcp_port = port; }
-    if let Some(port) = cli.remote_udp_port { cfg.remote_udp_port = port; }
+    if let Some(ref ip) = cli.local_ip {
+        cfg.local_ip = ip.clone();
+    }
+    if let Some(port) = cli.local_port {
+        cfg.local_port = port;
+    }
+    if let Some(ref ip) = cli.remote_ip {
+        cfg.remote_ip = ip.clone();
+    }
+    if let Some(port) = cli.remote_tcp_port {
+        cfg.remote_tcp_port = port;
+    }
+    if let Some(port) = cli.remote_udp_port {
+        cfg.remote_udp_port = port;
+    }
     let cfg = cfg.validate().unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
@@ -283,14 +297,17 @@ fn main() {
     ));
     log::push(format!(
         "Runtime: pool={} refill={} splice={} backlog={} udp_buf={} log={}",
-        cfg.pool_size, cfg.refill_batch, cfg.splice_chunk, cfg.listen_backlog,
-        cfg.udp_socket_buffer, if cfg.log_enable { "on" } else { "off" }
+        cfg.pool_size,
+        cfg.refill_batch,
+        cfg.splice_chunk,
+        cfg.listen_backlog,
+        cfg.udp_socket_buffer,
+        if cfg.log_enable { "on" } else { "off" }
     ));
 
     // Raise fd limit and set up signal handlers (#7).
-    let _ = nix::sys::resource::setrlimit(
-        nix::sys::resource::Resource::RLIMIT_NOFILE, 65535, 65535,
-    );
+    let _ =
+        nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, 65535, 65535);
     let sa_ign = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
     let sa_shut = SigAction::new(
         SigHandler::Handler(handle_shutdown),
@@ -303,7 +320,7 @@ fn main() {
         sigaction(Signal::SIGINT, &sa_shut).unwrap();
     }
 
-    let local_addr      = s::resolve(&cfg.local_ip, cfg.local_port, Type::STREAM)
+    let local_addr = s::resolve(&cfg.local_ip, cfg.local_port, Type::STREAM)
         .expect("failed to resolve LOCAL_IP");
     let remote_tcp_addr = s::resolve(&cfg.remote_ip, cfg.remote_tcp_port, Type::STREAM)
         .expect("failed to resolve REMOTE_TCP");
@@ -331,14 +348,18 @@ fn main() {
 
     // Epoll instance (#2: raw epoll with ET).
     let epoll = Epoll::new(EpollCreateFlags::empty()).expect("epoll_create1 failed");
-    epoll.add(
-        tcp_listen.as_fd(),
-        EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, TOKEN_ACCEPT),
-    ).unwrap();
-    epoll.add(
-        udp_listen.as_fd(),
-        EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, TOKEN_UDP),
-    ).unwrap();
+    epoll
+        .add(
+            tcp_listen.as_fd(),
+            EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, TOKEN_ACCEPT),
+        )
+        .unwrap();
+    epoll
+        .add(
+            udp_listen.as_fd(),
+            EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, TOKEN_UDP),
+        )
+        .unwrap();
 
     // Preconnection pool.
     let pool = Arc::new(Mutex::new(Pool::new(cfg.pool_size)));
@@ -472,14 +493,12 @@ fn main() {
                             // point attempting the second — the Conn will be
                             // freed below and close() auto-deregisters the fd
                             // from epoll on Linux (no dup anywhere).
-                            if epoll.add(
-                                c.fd_l.as_fd(),
-                                EpollEvent::new(init_flags_l, token_l),
-                            ).is_err()
-                                || epoll.add(
-                                    c.fd_r.as_fd(),
-                                    EpollEvent::new(init_flags_r, token_r),
-                                ).is_err()
+                            if epoll
+                                .add(c.fd_l.as_fd(), EpollEvent::new(init_flags_l, token_l))
+                                .is_err()
+                                || epoll
+                                    .add(c.fd_r.as_fd(), EpollEvent::new(init_flags_r, token_r))
+                                    .is_err()
                             {
                                 free_slot(&mut conns, &mut free_slots, slab_idx);
                             }
@@ -501,33 +520,36 @@ fn main() {
                             // O(1) hashmap lookup for known clients.
                             let up_fd_raw = if let Some(net) = cli_net {
                                 if let Some(&slot) = udp_map.get(&net) {
-                                    udp_slots.get_mut(slot)
-                                        .and_then(|s| s.as_mut())
-                                        .map(|a| { a.last_act = now; a.up_fd.as_raw_fd() })
+                                    udp_slots.get_mut(slot).and_then(|s| s.as_mut()).map(|a| {
+                                        a.last_act = now;
+                                        a.up_fd.as_raw_fd()
+                                    })
                                 } else {
                                     None
                                 }
                             } else {
                                 // Exotic address family: linear scan.
-                                udp_slots.iter_mut()
+                                udp_slots
+                                    .iter_mut()
                                     .filter_map(|s| s.as_mut())
                                     .find(|a| s::nix_storage_eq(&a.cli_addr, &cli_addr))
-                                    .map(|a| { a.last_act = now; a.up_fd.as_raw_fd() })
+                                    .map(|a| {
+                                        a.last_act = now;
+                                        a.up_fd.as_raw_fd()
+                                    })
                             };
 
                             if let Some(fd) = up_fd_raw {
-                                let _ = nix::sys::socket::send(
-                                    fd, &buf[..n], MsgFlags::MSG_DONTWAIT,
-                                );
+                                let _ =
+                                    nix::sys::socket::send(fd, &buf[..n], MsgFlags::MSG_DONTWAIT);
                             } else {
                                 // New client — create a connected upstream UDP socket.
                                 match s::create_udp_socket(domain, &cfg) {
                                     Ok(up_sock) => {
                                         // socket2::connect is safe (#4).
                                         let _ = up_sock.connect(&remote_udp_addr);
-                                        let up_owned = unsafe {
-                                            OwnedFd::from_raw_fd(up_sock.into_raw_fd())
-                                        };
+                                        let up_owned =
+                                            unsafe { OwnedFd::from_raw_fd(up_sock.into_raw_fd()) };
                                         let slot_idx = if let Some(idx) = udp_free.pop_front() {
                                             idx
                                         } else {
@@ -536,12 +558,16 @@ fn main() {
                                             idx
                                         };
                                         let t = UDP_BASE + slot_idx as u64;
-                                        if epoll.add(
-                                            up_owned.as_fd(),
-                                            EpollEvent::new(
-                                                EpollFlags::EPOLLIN | EpollFlags::EPOLLET, t,
-                                            ),
-                                        ).is_ok() {
+                                        if epoll
+                                            .add(
+                                                up_owned.as_fd(),
+                                                EpollEvent::new(
+                                                    EpollFlags::EPOLLIN | EpollFlags::EPOLLET,
+                                                    t,
+                                                ),
+                                            )
+                                            .is_ok()
+                                        {
                                             let _ = nix::sys::socket::send(
                                                 up_owned.as_raw_fd(),
                                                 &buf[..n],
@@ -579,9 +605,7 @@ fn main() {
                     let up_raw = assoc.up_fd.as_raw_fd();
                     loop {
                         // nix::sys::socket::recv is safe (#4).
-                        match nix::sys::socket::recv(
-                            up_raw, &mut buf, MsgFlags::MSG_DONTWAIT,
-                        ) {
+                        match nix::sys::socket::recv(up_raw, &mut buf, MsgFlags::MSG_DONTWAIT) {
                             Ok(n) if n > 0 => {
                                 // sendto with nix — no unsafe (#4).
                                 let _ = sendto(
@@ -611,8 +635,10 @@ fn main() {
             // Handle in-progress connect completing on fd_r.
             if is_remote && conn.connecting {
                 if ev_flags.intersects(
-                    EpollFlags::EPOLLOUT | EpollFlags::EPOLLERR |
-                    EpollFlags::EPOLLHUP | EpollFlags::EPOLLRDHUP,
+                    EpollFlags::EPOLLOUT
+                        | EpollFlags::EPOLLERR
+                        | EpollFlags::EPOLLHUP
+                        | EpollFlags::EPOLLRDHUP,
                 ) {
                     let err = nix::sys::socket::getsockopt(
                         &conn.fd_r,
@@ -632,7 +658,8 @@ fn main() {
             // Immediate close on EPOLLERR (matches C version behaviour).
             if ev_flags.contains(EpollFlags::EPOLLERR) {
                 log::push(format!(
-                    "Connection Error: {}", if is_remote { "Remote" } else { "Local" }
+                    "Connection Error: {}",
+                    if is_remote { "Remote" } else { "Local" }
                 ));
                 free_slot(&mut conns, &mut free_slots, idx);
                 continue;
@@ -644,9 +671,14 @@ fn main() {
             // ── Pump local → remote ──
             if !conn.eof_l2r {
                 let res = pump(
-                    conn.fd_l.as_fd(), conn.fd_r.as_fd(),
-                    conn.pipe_l2r_w.as_fd(), conn.pipe_l2r_r.as_fd(),
-                    &mut conn.len_l2r, splice_chunk, now, &mut conn.last_l2r,
+                    conn.fd_l.as_fd(),
+                    conn.fd_r.as_fd(),
+                    conn.pipe_l2r_w.as_fd(),
+                    conn.pipe_l2r_r.as_fd(),
+                    &mut conn.len_l2r,
+                    splice_chunk,
+                    now,
+                    &mut conn.last_l2r,
                 );
                 match res {
                     PumpStatus::Err => {
@@ -671,13 +703,22 @@ fn main() {
                 let mut drain_err = false;
                 while conn.len_l2r > 0 {
                     match splice(
-                        conn.pipe_l2r_r.as_fd(), None,
-                        conn.fd_r.as_fd(), None,
-                        conn.len_l2r, flags,
+                        conn.pipe_l2r_r.as_fd(),
+                        None,
+                        conn.fd_r.as_fd(),
+                        None,
+                        conn.len_l2r,
+                        flags,
                     ) {
-                        Ok(n) if n > 0 => { conn.len_l2r -= n; conn.last_l2r = now; }
+                        Ok(n) if n > 0 => {
+                            conn.len_l2r -= n;
+                            conn.last_l2r = now;
+                        }
                         Err(Errno::EAGAIN) => break,
-                        _ => { drain_err = true; break; }
+                        _ => {
+                            drain_err = true;
+                            break;
+                        }
                     }
                 }
                 if drain_err {
@@ -694,9 +735,14 @@ fn main() {
             // ── Pump remote → local ──
             if !conn.eof_r2l {
                 let res = pump(
-                    conn.fd_r.as_fd(), conn.fd_l.as_fd(),
-                    conn.pipe_r2l_w.as_fd(), conn.pipe_r2l_r.as_fd(),
-                    &mut conn.len_r2l, splice_chunk, now, &mut conn.last_r2l,
+                    conn.fd_r.as_fd(),
+                    conn.fd_l.as_fd(),
+                    conn.pipe_r2l_w.as_fd(),
+                    conn.pipe_r2l_r.as_fd(),
+                    &mut conn.len_r2l,
+                    splice_chunk,
+                    now,
+                    &mut conn.last_r2l,
                 );
                 match res {
                     PumpStatus::Err => {
@@ -720,13 +766,22 @@ fn main() {
                 let mut drain_err = false;
                 while conn.len_r2l > 0 {
                     match splice(
-                        conn.pipe_r2l_r.as_fd(), None,
-                        conn.fd_l.as_fd(), None,
-                        conn.len_r2l, flags,
+                        conn.pipe_r2l_r.as_fd(),
+                        None,
+                        conn.fd_l.as_fd(),
+                        None,
+                        conn.len_r2l,
+                        flags,
                     ) {
-                        Ok(n) if n > 0 => { conn.len_r2l -= n; conn.last_r2l = now; }
+                        Ok(n) if n > 0 => {
+                            conn.len_r2l -= n;
+                            conn.last_r2l = now;
+                        }
                         Err(Errno::EAGAIN) => break,
-                        _ => { drain_err = true; break; }
+                        _ => {
+                            drain_err = true;
+                            break;
+                        }
                     }
                 }
                 if drain_err {
@@ -772,7 +827,8 @@ fn main() {
                             if now.duration_since(hs) > Duration::from_secs(cfg.half_close_timeout)
                             {
                                 log::push(format!(
-                                    "Half-close timeout({}s)", cfg.half_close_timeout
+                                    "Half-close timeout({}s)",
+                                    cfg.half_close_timeout
                                 ));
                                 true
                             } else {

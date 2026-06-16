@@ -55,7 +55,11 @@ impl Pool {
     pub fn put(&mut self, fd: OwnedFd, now: Instant, base_ttl_ms: u64) -> bool {
         if self.entries.len() < self.max_size {
             let ttl_ms = self.jittered_ttl(base_ttl_ms);
-            self.entries.push(PoolEntry { fd, birth: now, ttl_ms });
+            self.entries.push(PoolEntry {
+                fd,
+                birth: now,
+                ttl_ms,
+            });
             true
         } else {
             // fd drops here → closed automatically.
@@ -215,7 +219,11 @@ pub fn spawn_maintain_thread(
                 // Adaptive cap (#6): recover at full refill_batch speed when the
                 // pool is more than half empty; throttle to 2 for steady-state
                 // top-ups to avoid connect bursts.
-                let cap = if deficit > cfg.pool_size / 2 { cfg.refill_batch } else { 2 };
+                let cap = if deficit > cfg.pool_size / 2 {
+                    cfg.refill_batch
+                } else {
+                    2
+                };
                 let want = deficit.min(cfg.refill_batch).min(cap);
                 for _ in 0..want {
                     p.pending += 1;
@@ -306,4 +314,3 @@ fn connect_fail(pool: &Mutex<Pool>, cfg: &Config) {
         p.pause_until = Some(Instant::now() + backoff);
     }
 }
-

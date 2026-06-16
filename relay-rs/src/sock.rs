@@ -137,6 +137,7 @@ pub fn socket_dead_fast(fd: RawFd) -> bool {
 }
 
 /// Compare two sockaddr values for equality (ip + port).
+#[allow(dead_code)]
 pub fn sockaddr_eq(a: &SockAddr, b: &SockAddr) -> bool {
     let a_len = a.len();
     let b_len = b.len();

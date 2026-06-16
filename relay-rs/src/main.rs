@@ -12,7 +12,7 @@ mod pool;
 mod sock;
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -463,7 +463,6 @@ fn main() {
                                 free_slot(&mut conns, &mut free_slots, slab_idx);
                             }
                         }
-                        Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => break,
                         Err(_) => break,
                     }
                 }
@@ -545,7 +544,6 @@ fn main() {
                             }
                         }
                         Ok((_, None)) => {} // no address returned
-                        Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => break,
                         Err(_) => break,
                     }
                 }
@@ -573,7 +571,6 @@ fn main() {
                                 );
                                 assoc.last_act = now;
                             }
-                            Err(Errno::EAGAIN) | Err(Errno::EWOULDBLOCK) => break,
                             _ => break,
                         }
                     }

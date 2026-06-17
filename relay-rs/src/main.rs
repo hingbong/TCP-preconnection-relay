@@ -13,7 +13,7 @@ mod sock;
 
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,11 @@ use sock as s;
 // ── Signal handling (#7) ─────────────────────────────────────────────────────
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+// ── Connection statistics ────────────────────────────────────────────────────
+
+static STAT_TOTAL_ACCEPTS: AtomicU64 = AtomicU64::new(0);
+static STAT_POOL_HITS: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn handle_shutdown(_sig: libc::c_int) {
     // AtomicBool store is async-signal-safe.
@@ -439,6 +444,7 @@ fn main() {
                 loop {
                     match accept4(tcp_listen.as_raw_fd(), SockFlag::SOCK_NONBLOCK) {
                         Ok(cli_fd) => {
+                            STAT_TOTAL_ACCEPTS.fetch_add(1, Ordering::Relaxed);
                             let cli_sock = unsafe { Socket::from_raw_fd(cli_fd) };
                             s::set_tcp_options(&cli_sock, &cfg);
                             let cli_owned: OwnedFd =
@@ -452,6 +458,7 @@ fn main() {
                             };
 
                             let (rem_owned, connecting) = if let Some(owned) = pool_fd {
+                                STAT_POOL_HITS.fetch_add(1, Ordering::Relaxed);
                                 (owned, false)
                             } else {
                                 log::push("Exceeded Connections Pool, Direct Out...");
@@ -977,6 +984,25 @@ fn main() {
                     udp_free.push_back(slot_idx);
                 }
             }
+
+            // ── Stats log (1 Hz) ──
+            let total = STAT_TOTAL_ACCEPTS.load(Ordering::Relaxed);
+            let hits = STAT_POOL_HITS.load(Ordering::Relaxed);
+            let active = conns.iter().filter(|c| c.is_some()).count();
+            let pool_sz = if cfg.pool_size > 0 {
+                pool.lock().unwrap().len()
+            } else {
+                0
+            };
+            let rate = if total > 0 {
+                (hits as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            log::push(format!(
+                "Stats: pool={pool_sz}/{} hit={:.0}% ({hits}/{total}) active_tcp={active}",
+                cfg.pool_size, rate,
+            ));
         }
     }
 

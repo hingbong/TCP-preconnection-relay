@@ -44,6 +44,10 @@ impl Pool {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     fn next_rng(&mut self) -> u64 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;

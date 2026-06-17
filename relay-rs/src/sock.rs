@@ -231,26 +231,29 @@ pub fn udp_recvmmsg(
             iov_base: bufs[i].as_mut_ptr() as *mut libc::c_void,
             iov_len: UDP_PKT_SIZE,
         });
+        // Use MaybeUninit to avoid musl private-field build errors.
+        let mut hdr: libc::msghdr = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
+        hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        hdr.msg_iov = &raw mut iovs[i];
+        hdr.msg_iovlen = 1;
         msgs.push(libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: &mut addrs[i] as *mut _ as *mut libc::c_void,
-                msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as u32,
-                msg_iov: &raw mut iovs[i],
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
+            msg_hdr: hdr,
             msg_len: 0,
         });
     }
 
     let rc = unsafe {
+        #[cfg(not(target_env = "musl"))]
+        let flags = libc::MSG_DONTWAIT;
+        #[cfg(target_env = "musl")]
+        let flags = libc::MSG_DONTWAIT as u32;
+
         libc::recvmmsg(
             fd,
             msgs.as_mut_ptr(),
             n as u32,
-            libc::MSG_DONTWAIT,
+            flags,
             std::ptr::null_mut(),
         )
     };
@@ -289,26 +292,29 @@ pub fn udp_sendmmsg_to(
             iov_base: data[i].as_ptr() as *mut libc::c_void,
             iov_len: data[i].len(),
         });
+        // Use MaybeUninit to avoid musl private-field build errors.
+        let mut hdr: libc::msghdr = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        hdr.msg_name = addr_ptr;
+        hdr.msg_namelen = addr_len;
+        hdr.msg_iov = &raw mut iovs[i];
+        hdr.msg_iovlen = 1;
         msgs.push(libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: addr_ptr,
-                msg_namelen: addr_len,
-                msg_iov: &raw mut iovs[i],
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
+            msg_hdr: hdr,
             msg_len: 0,
         });
     }
 
     let rc = unsafe {
+        #[cfg(not(target_env = "musl"))]
+        let flags = libc::MSG_DONTWAIT;
+        #[cfg(target_env = "musl")]
+        let flags = libc::MSG_DONTWAIT as u32;
+
         libc::sendmmsg(
             fd,
             msgs.as_mut_ptr(),
             n as u32,
-            libc::MSG_DONTWAIT,
+            flags,
         )
     };
     if rc < 0 {

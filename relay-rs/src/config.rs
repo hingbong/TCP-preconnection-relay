@@ -35,6 +35,10 @@ pub struct Config {
     pub half_close_timeout: u64,
     #[serde(default = "default_preconnect_ttl_ms")]
     pub preconnect_ttl_ms: u64,
+    #[serde(default = "default_pool_min_size")]
+    pub pool_min_size: usize,
+    #[serde(default = "default_ttl_jitter_pct")]
+    pub ttl_jitter_pct: u8,
     #[serde(default = "default_splice_chunk")]
     pub splice_chunk: usize,
 
@@ -43,6 +47,8 @@ pub struct Config {
     pub udp_idle_timeout: u64,
     #[serde(default = "default_udp_socket_buffer")]
     pub udp_socket_buffer: usize,
+    #[serde(default = "default_udp_batch_size")]
+    pub udp_batch_size: usize,
 
     // ── Listen ───────────────────────────────────────────────
     #[serde(default = "default_listen_backlog")]
@@ -93,6 +99,15 @@ fn default_udp_idle_timeout() -> u64 {
 fn default_udp_socket_buffer() -> usize {
     4_194_304
 }
+fn default_udp_batch_size() -> usize {
+    64
+}
+fn default_pool_min_size() -> usize {
+    0
+}
+fn default_ttl_jitter_pct() -> u8 {
+    25
+}
 fn default_listen_backlog() -> i32 {
     16_384
 }
@@ -129,9 +144,12 @@ impl Default for Config {
             idle_timeout: default_idle_timeout(),
             half_close_timeout: default_half_close_timeout(),
             preconnect_ttl_ms: default_preconnect_ttl_ms(),
+            pool_min_size: default_pool_min_size(),
+            ttl_jitter_pct: default_ttl_jitter_pct(),
             splice_chunk: default_splice_chunk(),
             udp_idle_timeout: default_udp_idle_timeout(),
             udp_socket_buffer: default_udp_socket_buffer(),
+            udp_batch_size: default_udp_batch_size(),
             listen_backlog: default_listen_backlog(),
             log_rate_per_sec: default_log_rate_per_sec(),
             log_enable: default_log_enable(),
@@ -169,6 +187,9 @@ impl Config {
         apply_env_usize("SPLICE_CHUNK", &mut self.splice_chunk);
         apply_env_u64("UDP_IDLE_TIMEOUT", &mut self.udp_idle_timeout);
         apply_env_usize("UDP_SOCKET_BUFFER", &mut self.udp_socket_buffer);
+        apply_env_usize("UDP_BATCH_SIZE", &mut self.udp_batch_size);
+        apply_env_usize("POOL_MIN_SIZE", &mut self.pool_min_size);
+        apply_env_u8("TTL_JITTER_PCT", &mut self.ttl_jitter_pct);
         apply_env_i32("LISTEN_BACKLOG", &mut self.listen_backlog);
         apply_env_usize("LOG_RATE_PER_SEC", &mut self.log_rate_per_sec);
         apply_env_bool("LOG_ENABLE", &mut self.log_enable);
@@ -213,6 +234,15 @@ impl Config {
         }
         if !(16 * 1024..=1024 * 1024).contains(&self.splice_chunk) {
             return Err("splice_chunk must be between 16 KiB and 1 MiB".into());
+        }
+        if self.udp_batch_size < 1 || self.udp_batch_size > 128 {
+            return Err("udp_batch_size must be between 1 and 128".into());
+        }
+        if self.pool_min_size > self.pool_size {
+            return Err("pool_min_size must be <= pool_size".into());
+        }
+        if self.ttl_jitter_pct > 50 {
+            return Err("ttl_jitter_pct must be <= 50".into());
         }
         if self.connect_timeout < 1 || self.connect_timeout > 65 {
             return Err("connect_timeout must be between 1 and 65 seconds".into());
@@ -268,6 +298,16 @@ fn apply_env_u64(name: &str, target: &mut u64) {
 }
 
 fn apply_env_usize(name: &str, target: &mut usize) {
+    if let Ok(val) = env::var(name) {
+        if let Ok(v) = val.parse() {
+            *target = v;
+        } else {
+            eprintln!("WARN: invalid {name}={val}, keeping {target}");
+        }
+    }
+}
+
+fn apply_env_u8(name: &str, target: &mut u8) {
     if let Ok(val) = env::var(name) {
         if let Ok(v) = val.parse() {
             *target = v;

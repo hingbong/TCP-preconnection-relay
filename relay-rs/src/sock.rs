@@ -201,3 +201,119 @@ pub fn nix_storage_eq(
         ) == 0
     }
 }
+
+// ── Batched UDP (sendmmsg / recvmmsg) ────────────────────────────────────────
+
+pub const UDP_BATCH_MAX: usize = 128;
+pub const UDP_PKT_SIZE: usize = 1500;
+
+/// Receive up to `n` UDP packets from `fd` via recvmmsg(2).
+/// Returns count of received packets (0 on EAGAIN or error).
+/// Each received packet's source address is written into `addrs[i]` and
+/// data size into `lens[i]`.
+pub fn udp_recvmmsg(
+    fd: RawFd,
+    bufs: &mut [[u8; UDP_PKT_SIZE]],
+    lens: &mut [u32],
+    addrs: &mut [libc::sockaddr_storage],
+    n: usize,
+) -> usize {
+    let n = n.min(UDP_BATCH_MAX).min(bufs.len());
+    if n == 0 {
+        return 0;
+    }
+
+    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(n);
+    let mut iovs: Vec<libc::iovec> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        iovs.push(libc::iovec {
+            iov_base: bufs[i].as_mut_ptr() as *mut libc::c_void,
+            iov_len: UDP_PKT_SIZE,
+        });
+        msgs.push(libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: &mut addrs[i] as *mut _ as *mut libc::c_void,
+                msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as u32,
+                msg_iov: &raw mut iovs[i],
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            msg_len: 0,
+        });
+    }
+
+    let rc = unsafe {
+        libc::recvmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            n as u32,
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc < 0 {
+        return 0;
+    }
+    let count = rc as usize;
+    for i in 0..count {
+        lens[i] = msgs[i].msg_len;
+    }
+    count
+}
+
+/// Send up to `n` packets to the same destination via sendmmsg(2).
+/// `data[i]` is the payload for the i-th packet.
+/// Returns count of packets actually sent.
+pub fn udp_sendmmsg_to(
+    fd: RawFd,
+    data: &[&[u8]],
+    addr: &libc::sockaddr_storage,
+    addr_len: libc::socklen_t,
+    n: usize,
+) -> usize {
+    let n = n.min(UDP_BATCH_MAX).min(data.len());
+    if n == 0 {
+        return 0;
+    }
+
+    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(n);
+    let mut iovs: Vec<libc::iovec> = Vec::with_capacity(n);
+    // Need a mutable copy of addr for the msghdr (safe cast: only read by kernel).
+    let addr_ptr = addr as *const libc::sockaddr_storage as *mut libc::c_void;
+
+    for i in 0..n {
+        iovs.push(libc::iovec {
+            iov_base: data[i].as_ptr() as *mut libc::c_void,
+            iov_len: data[i].len(),
+        });
+        msgs.push(libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: addr_ptr,
+                msg_namelen: addr_len,
+                msg_iov: &raw mut iovs[i],
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            msg_len: 0,
+        });
+    }
+
+    let rc = unsafe {
+        libc::sendmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            n as u32,
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if rc < 0 {
+        0
+    } else {
+        rc as usize
+    }
+}

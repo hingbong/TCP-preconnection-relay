@@ -23,7 +23,7 @@ use nix::fcntl::{splice, FcntlArg, SpliceFFlags};
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::sys::socket::{
-    accept4, connect, recvfrom, sendto, MsgFlags, SockFlag, SockaddrLike, SockaddrStorage,
+    accept4, connect, MsgFlags, SockFlag, SockaddrLike, SockaddrStorage,
 };
 use nix::unistd::pipe2;
 use socket2::{SockAddr, Socket, Type};
@@ -128,6 +128,8 @@ fn pump(
                     src_eagain = true;
                     break;
                 }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::ENOMEM) => break,
                 Err(_) => return PumpStatus::Err,
             }
         }
@@ -140,6 +142,7 @@ fn pump(
                     *last_ts = now;
                 }
                 Err(Errno::EAGAIN) => break,
+                Err(Errno::EINTR) => continue,
                 Err(_) => return PumpStatus::Err,
                 Ok(_) => break, // splice returned 0 yet pipe still has data — shouldn't happen, but break to avoid infinite loop
             }
@@ -381,7 +384,7 @@ fn main() {
         .unwrap();
 
     // Preconnection pool.
-    let pool = Arc::new(Mutex::new(Pool::new(cfg.pool_size)));
+    let pool = Arc::new(Mutex::new(Pool::new(cfg.pool_size, cfg.ttl_jitter_pct)));
     if cfg.pool_size > 0 {
         let cfg_arc = Arc::new(cfg.clone());
         pool::spawn_maintain_thread(
@@ -569,124 +572,153 @@ fn main() {
                 continue;
             }
 
-            // ── UDP inbound (client → us → upstream) (#4: safe nix wrappers) ──
+            // ── UDP inbound (client → us → upstream) ──
+            // Batched recv via recvmmsg(2); per-packet dispatch to upstream.
             if token == TOKEN_UDP {
-                let mut buf = [0u8; 65535];
+                const BUF: usize = s::UDP_PKT_SIZE;
+                let batch = cfg.udp_batch_size.min(s::UDP_BATCH_MAX);
+                let mut bufs: [[u8; BUF]; s::UDP_BATCH_MAX] = [[0u8; BUF]; s::UDP_BATCH_MAX];
+                let mut lens: [u32; s::UDP_BATCH_MAX] = [0; s::UDP_BATCH_MAX];
+                let mut addrs: [libc::sockaddr_storage; s::UDP_BATCH_MAX] =
+                    unsafe { std::mem::zeroed() };
                 loop {
-                    match recvfrom::<SockaddrStorage>(udp_listen.as_raw_fd(), &mut buf) {
-                        Ok((n, Some(cli_addr))) => {
-                            let cli_net = s::storage_to_net(&cli_addr);
+                    let n = s::udp_recvmmsg(
+                        udp_listen.as_raw_fd(),
+                        &mut bufs,
+                        &mut lens,
+                        &mut addrs,
+                        batch,
+                    );
+                    if n == 0 {
+                        break;
+                    }
+                    for i in 0..n {
+                        let data = &bufs[i][..lens[i] as usize];
+                        // Translate sockaddr_storage to nix SockaddrStorage for lookup.
+                        let cli_addr: SockaddrStorage = unsafe {
+                            SockaddrStorage::from_raw(
+                                &addrs[i] as *const _ as *const libc::sockaddr,
+                                Some(std::mem::size_of::<libc::sockaddr_storage>() as _),
+                            )
+                            .unwrap()
+                        };
+                        let cli_net = s::storage_to_net(&cli_addr);
 
-                            // O(1) hashmap lookup for known clients.
-                            let up_fd_raw = if let Some(net) = cli_net {
-                                if let Some(&slot) = udp_map.get(&net) {
-                                    udp_slots.get_mut(slot).and_then(|s| s.as_mut()).map(|a| {
-                                        a.last_act = now;
-                                        a.up_fd.as_raw_fd()
-                                    })
-                                } else {
-                                    None
-                                }
+                        let up_fd_raw = if let Some(net) = cli_net {
+                            if let Some(&slot) = udp_map.get(&net) {
+                                udp_slots.get_mut(slot).and_then(|s| s.as_mut()).map(|a| {
+                                    a.last_act = now;
+                                    a.up_fd.as_raw_fd()
+                                })
                             } else {
-                                // Exotic address family: linear scan.
-                                udp_slots
-                                    .iter_mut()
-                                    .filter_map(|s| s.as_mut())
-                                    .find(|a| s::nix_storage_eq(&a.cli_addr, &cli_addr))
-                                    .map(|a| {
-                                        a.last_act = now;
-                                        a.up_fd.as_raw_fd()
-                                    })
-                            };
+                                None
+                            }
+                        } else {
+                            udp_slots
+                                .iter_mut()
+                                .filter_map(|s| s.as_mut())
+                                .find(|a| s::nix_storage_eq(&a.cli_addr, &cli_addr))
+                                .map(|a| {
+                                    a.last_act = now;
+                                    a.up_fd.as_raw_fd()
+                                })
+                        };
 
-                            if let Some(fd) = up_fd_raw {
-                                let _ =
-                                    nix::sys::socket::send(fd, &buf[..n], MsgFlags::MSG_DONTWAIT);
-                            } else {
-                                // New client — create a connected upstream UDP socket.
-                                match s::create_udp_socket(domain, &cfg) {
-                                    Ok(up_sock) => {
-                                        // socket2::connect is safe (#4).
-                                        let _ = up_sock.connect(&remote_udp_addr);
-                                        let up_owned =
-                                            unsafe { OwnedFd::from_raw_fd(up_sock.into_raw_fd()) };
-                                        let slot_idx = if let Some(idx) = udp_free.pop_front() {
-                                            idx
-                                        } else {
-                                            let idx = udp_slots.len();
-                                            udp_slots.push(None);
-                                            idx
-                                        };
-                                        let t = UDP_BASE + slot_idx as u64;
-                                        if epoll
-                                            .add(
-                                                up_owned.as_fd(),
-                                                EpollEvent::new(
-                                                    EpollFlags::EPOLLIN | EpollFlags::EPOLLET,
-                                                    t,
-                                                ),
-                                            )
-                                            .is_ok()
-                                        {
-                                            let _ = nix::sys::socket::send(
-                                                up_owned.as_raw_fd(),
-                                                &buf[..n],
-                                                MsgFlags::MSG_DONTWAIT,
-                                            );
-                                            if let Some(net) = cli_net {
-                                                udp_map.insert(net, slot_idx);
-                                            }
-                                            udp_slots[slot_idx] = Some(UdpAssoc {
-                                                cli_addr,
-                                                cli_net_addr: cli_net,
-                                                up_fd: up_owned,
-                                                last_act: now,
-                                            });
-                                        } else {
-                                            udp_free.push_back(slot_idx);
+                        if let Some(fd) = up_fd_raw {
+                            let _ = nix::sys::socket::send(fd, data, MsgFlags::MSG_DONTWAIT);
+                        } else {
+                            match s::create_udp_socket(domain, &cfg) {
+                                Ok(up_sock) => {
+                                    let _ = up_sock.connect(&remote_udp_addr);
+                                    let up_owned = unsafe {
+                                        OwnedFd::from_raw_fd(up_sock.into_raw_fd())
+                                    };
+                                    let slot_idx = if let Some(idx) = udp_free.pop_front() {
+                                        idx
+                                    } else {
+                                        let idx = udp_slots.len();
+                                        udp_slots.push(None);
+                                        idx
+                                    };
+                                    let t = UDP_BASE + slot_idx as u64;
+                                    if epoll
+                                        .add(
+                                            up_owned.as_fd(),
+                                            EpollEvent::new(
+                                                EpollFlags::EPOLLIN | EpollFlags::EPOLLET,
+                                                t,
+                                            ),
+                                        )
+                                        .is_ok()
+                                    {
+                                        let _ = nix::sys::socket::send(
+                                            up_owned.as_raw_fd(),
+                                            data,
+                                            MsgFlags::MSG_DONTWAIT,
+                                        );
+                                        if let Some(net) = cli_net {
+                                            udp_map.insert(net, slot_idx);
                                         }
+                                        udp_slots[slot_idx] = Some(UdpAssoc {
+                                            cli_addr,
+                                            cli_net_addr: cli_net,
+                                            up_fd: up_owned,
+                                            last_act: now,
+                                        });
+                                    } else {
+                                        udp_free.push_back(slot_idx);
                                     }
-                                    Err(_) => {}
                                 }
+                                Err(_) => {}
                             }
                         }
-                        Ok((_, None)) => {} // no address returned
-                        Err(_) => break,
                     }
                 }
                 continue;
             }
 
-            // ── UDP upstream response (upstream → us → client) ────────────────
-            // Three-layer defense against TCP token → UDP slot collision:
-            // 1. token >= UDP_BASE: only tokens in [UDP_BASE, TOKEN_UDP) reach
-            //    here.  TCP tokens with gen=0 would need slab index ≥ 33.5M to
-            //    collide — impossible with free-list slab reuse in practice.
-            //    TCP tokens with gen≥1 are ≥ 2^48 and produce slot_idx values
-            //    far beyond udp_slots.len(), caught by layer 2.
-            // 2. slot_idx < udp_slots.len(): out-of-range indices → skipped.
-            // 3. udp_slots[slot_idx].is_some(): freed UDP slots are None → no
-            //    false dispatch.
+            // ── UDP upstream response (upstream → us → client) ──
+            // Batched recv + sendmmsg(2) back to same client.
             if token >= UDP_BASE {
                 let slot_idx = (token - UDP_BASE) as usize;
                 if slot_idx < udp_slots.len() {
-                    let mut buf = [0u8; 65535];
                     if let Some(Some(ref mut assoc)) = udp_slots.get_mut(slot_idx) {
                         let up_raw = assoc.up_fd.as_raw_fd();
+                        let cli_addr = &assoc.cli_addr;
+                        let cli_addr_len = cli_addr.len();
+                        let cli_ptr =
+                            cli_addr.as_ptr() as *const libc::sockaddr_storage as *const _;
+
+                        const BUF: usize = s::UDP_PKT_SIZE;
+                        let batch = cfg.udp_batch_size.min(s::UDP_BATCH_MAX);
+                        let mut bufs: [[u8; BUF]; s::UDP_BATCH_MAX] =
+                            [[0u8; BUF]; s::UDP_BATCH_MAX];
+                        let mut lens: [u32; s::UDP_BATCH_MAX] = [0; s::UDP_BATCH_MAX];
+                        let mut addrs: [libc::sockaddr_storage; s::UDP_BATCH_MAX] =
+                            unsafe { std::mem::zeroed() };
                         loop {
-                            // nix::sys::socket::recv is safe (#4).
-                            match nix::sys::socket::recv(up_raw, &mut buf, MsgFlags::MSG_DONTWAIT) {
-                                Ok(n) if n > 0 => {
-                                    // sendto with nix — no unsafe (#4).
-                                    let _ = sendto(
-                                        udp_listen.as_raw_fd(),
-                                        &buf[..n],
-                                        &assoc.cli_addr,
-                                        MsgFlags::MSG_DONTWAIT,
-                                    );
-                                    assoc.last_act = now;
-                                }
-                                _ => break,
+                            let n = s::udp_recvmmsg(
+                                up_raw,
+                                &mut bufs,
+                                &mut lens,
+                                &mut addrs,
+                                batch,
+                            );
+                            if n == 0 {
+                                break;
+                            }
+                            let slices: Vec<&[u8]> = (0..n)
+                                .map(|i| &bufs[i][..lens[i] as usize])
+                                .collect();
+                            let sent = s::udp_sendmmsg_to(
+                                udp_listen.as_raw_fd(),
+                                &slices,
+                                unsafe { &*(cli_ptr as *const libc::sockaddr_storage) },
+                                cli_addr_len as u32,
+                                n,
+                            );
+                            if sent > 0 {
+                                assoc.last_act = now;
                             }
                         }
                     }
@@ -784,6 +816,7 @@ fn main() {
                             conn.last_l2r = now;
                         }
                         Err(Errno::EAGAIN) => break,
+                        Err(Errno::EINTR) => continue,
                         _ => {
                             drain_err = true;
                             break;
@@ -847,6 +880,7 @@ fn main() {
                             conn.last_r2l = now;
                         }
                         Err(Errno::EAGAIN) => break,
+                        Err(Errno::EINTR) => continue,
                         _ => {
                             drain_err = true;
                             break;

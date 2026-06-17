@@ -23,12 +23,13 @@ pub struct Pool {
     pub pending: usize,
     fail_streak: usize,
     pub pause_until: Option<Instant>,
-    /// Xorshift64 state for cheap ±25 % TTL jitter.
+    /// Xorshift64 state for cheap TTL jitter.
     rng: u64,
+    jitter_pct: u8,
 }
 
 impl Pool {
-    pub fn new(max_size: usize) -> Self {
+    pub fn new(max_size: usize, jitter_pct: u8) -> Self {
         Self {
             entries: Vec::with_capacity(max_size),
             max_size,
@@ -39,6 +40,7 @@ impl Pool {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0x517cc1b727220a95),
+            jitter_pct,
         }
     }
 
@@ -49,15 +51,16 @@ impl Pool {
         self.rng
     }
 
-    fn jittered_ttl(&mut self, base_ms: u64) -> u64 {
-        let quarter = base_ms / 4;
-        let span = quarter * 2 + 1;
-        base_ms - quarter + (self.next_rng() % span)
+    fn jittered_ttl(&mut self, base_ms: u64, jitter_pct: u8) -> u64 {
+        // jitter_pct=25 → ±25% around base_ms
+        let range = (base_ms * jitter_pct as u64 / 50) + 1;
+        let offset = range / 2;
+        base_ms.saturating_sub(offset) + (self.next_rng() % range)
     }
 
     pub fn put(&mut self, fd: OwnedFd, now: Instant, base_ttl_ms: u64) -> bool {
         if self.entries.len() < self.max_size {
-            let ttl_ms = self.jittered_ttl(base_ttl_ms);
+            let ttl_ms = self.jittered_ttl(base_ttl_ms, self.jitter_pct);
             self.entries.push(PoolEntry {
                 fd,
                 birth: now,
@@ -217,17 +220,23 @@ pub fn spawn_maintain_thread(
             }
 
             let deficit = cfg.pool_size.saturating_sub(p.entries.len() + p.pending);
+            let below_min = cfg.pool_min_size > 0 && p.entries.len() < cfg.pool_min_size;
             let paused = p.pause_until.map_or(false, |pu| now < pu);
-            if deficit > 0 && !paused {
-                // Adaptive cap (#6): recover at full refill_batch speed when the
-                // pool is more than half empty; throttle to 2 for steady-state
-                // top-ups to avoid connect bursts.
-                let cap = if deficit > cfg.pool_size / 2 {
-                    cfg.refill_batch
+            if (deficit > 0 || below_min) && !paused {
+                let want = if below_min {
+                    // Refill to at least min_size in this batch.
+                    (cfg.pool_min_size - p.entries.len()).min(cfg.refill_batch)
                 } else {
-                    2
+                    // Adaptive cap (#6): recover at full refill_batch speed when the
+                    // pool is more than half empty; throttle to 2 for steady-state
+                    // top-ups to avoid connect bursts.
+                    let cap = if deficit > cfg.pool_size / 2 {
+                        cfg.refill_batch
+                    } else {
+                        2
+                    };
+                    deficit.min(cfg.refill_batch).min(cap)
                 };
-                let want = deficit.min(cfg.refill_batch).min(cap);
                 for _ in 0..want {
                     p.pending += 1;
                     if tx.send(()).is_err() {

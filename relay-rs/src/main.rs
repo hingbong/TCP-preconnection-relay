@@ -49,8 +49,17 @@ extern "C" fn handle_shutdown(_sig: libc::c_int) {
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "relay", about = "TCP/UDP preconnection relay (Rust rewrite)")]
-struct Cli {
+    #[command(
+        name = "relay",
+        about = "TCP/UDP preconnection relay (Rust rewrite)",
+        version = concat!(
+            env!("CARGO_PKG_VERSION"),
+            " (", env!("GIT_COMMIT"), " ",
+            env!("BUILD_TIME"),
+            ")"
+        )
+    )]
+    struct Cli {
     #[arg(short = 'c', long, env = "RELAY_CONFIG")]
     config: Option<String>,
     #[arg(short, long, env = "LOCAL_IP")]
@@ -323,14 +332,16 @@ fn main() {
         cfg.local_ip, cfg.local_port, cfg.remote_ip, cfg.remote_tcp_port, cfg.remote_udp_port
     ));
     log::push(format!(
-        "Runtime: pool={} refill={} splice_chunk={} pipe={} backlog={} udp_buf={} log={}",
+        "Runtime: pool={} refill={} splice_chunk={} pipe={} backlog={} udp_buf={} log={} commit={} built={}",
         cfg.pool_size,
         cfg.refill_batch,
         cfg.splice_chunk,
         cfg.splice_pipe_size,
         cfg.listen_backlog,
         cfg.udp_socket_buffer,
-        if cfg.log_enable { "on" } else { "off" }
+        if cfg.log_enable { "on" } else { "off" },
+        env!("GIT_COMMIT"),
+        env!("BUILD_TIME"),
     ));
 
     // Raise fd limit and set up signal handlers (#7).

@@ -75,7 +75,7 @@ pub struct Config {
 
 // ── Serde default functions ────────────────────────────────────
 fn default_pool_size() -> usize {
-    24
+    32
 }
 fn default_refill_batch() -> usize {
     8

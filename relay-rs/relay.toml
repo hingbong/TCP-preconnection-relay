@@ -22,7 +22,7 @@ remote_udp_port   = 443
 #
 # Maximum number of preconnected sockets to keep.
 # Set to 0 to disable the pool (every client gets a direct connect).
-pool_size         = 24
+pool_size         = 32
 
 # How many connections to open per refill round.
 refill_batch      = 8

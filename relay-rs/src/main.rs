@@ -424,7 +424,7 @@ fn main() {
     let mut udp_slots: Vec<Option<UdpAssoc>> = Vec::new();
     let mut udp_free: VecDeque<usize> = VecDeque::new();
 
-    let mut events = vec![EpollEvent::new(EpollFlags::empty(), 0); 1024];
+    let mut events = vec![EpollEvent::new(EpollFlags::empty(), 0); 2048];
     let mut last_cleanup = Instant::now();
 
     // ── Event loop ───────────────────────────────────────────────────────────
@@ -726,12 +726,14 @@ fn main() {
                             if n == 0 {
                                 break;
                             }
-                            let slices: Vec<&[u8]> = (0..n)
-                                .map(|i| &bufs[i][..lens[i] as usize])
-                                .collect();
+                            let mut slices: [&[u8]; s::UDP_BATCH_MAX] =
+                                [b"" as &[u8]; s::UDP_BATCH_MAX];
+                            for i in 0..n {
+                                slices[i] = &bufs[i][..lens[i] as usize];
+                            }
                             let sent = s::udp_sendmmsg_to(
                                 udp_listen.as_raw_fd(),
-                                &slices,
+                                &slices[..n],
                                 unsafe { &*(cli_ptr as *const libc::sockaddr_storage) },
                                 cli_addr_len as u32,
                                 n,

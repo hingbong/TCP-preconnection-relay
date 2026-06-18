@@ -41,6 +41,8 @@ pub struct Config {
     pub ttl_jitter_pct: u8,
     #[serde(default = "default_splice_chunk")]
     pub splice_chunk: usize,
+    #[serde(default = "default_splice_pipe_size")]
+    pub splice_pipe_size: usize,
 
     // ── UDP ──────────────────────────────────────────────────
     #[serde(default = "default_udp_idle_timeout")]
@@ -91,7 +93,10 @@ fn default_preconnect_ttl_ms() -> u64 {
     60_000
 }
 fn default_splice_chunk() -> usize {
-    65_536
+    131_072
+}
+fn default_splice_pipe_size() -> usize {
+    1_048_576
 }
 fn default_udp_idle_timeout() -> u64 {
     60
@@ -147,6 +152,7 @@ impl Default for Config {
             pool_min_size: default_pool_min_size(),
             ttl_jitter_pct: default_ttl_jitter_pct(),
             splice_chunk: default_splice_chunk(),
+            splice_pipe_size: default_splice_pipe_size(),
             udp_idle_timeout: default_udp_idle_timeout(),
             udp_socket_buffer: default_udp_socket_buffer(),
             udp_batch_size: default_udp_batch_size(),
@@ -185,6 +191,7 @@ impl Config {
         apply_env_u64("HALF_CLOSE_TIMEOUT", &mut self.half_close_timeout);
         apply_env_u64("PRECONNECT_TTL_MS", &mut self.preconnect_ttl_ms);
         apply_env_usize("SPLICE_CHUNK", &mut self.splice_chunk);
+        apply_env_usize("SPLICE_PIPE_SIZE", &mut self.splice_pipe_size);
         apply_env_u64("UDP_IDLE_TIMEOUT", &mut self.udp_idle_timeout);
         apply_env_usize("UDP_SOCKET_BUFFER", &mut self.udp_socket_buffer);
         apply_env_usize("UDP_BATCH_SIZE", &mut self.udp_batch_size);
@@ -234,6 +241,9 @@ impl Config {
         }
         if !(16 * 1024..=1024 * 1024).contains(&self.splice_chunk) {
             return Err("splice_chunk must be between 16 KiB and 1 MiB".into());
+        }
+        if !(4096..=1_048_576).contains(&self.splice_pipe_size) {
+            return Err("splice_pipe_size must be between 4 KiB and 1 MiB".into());
         }
         if self.udp_batch_size < 1 || self.udp_batch_size > 128 {
             return Err("udp_batch_size must be between 1 and 128".into());

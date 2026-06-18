@@ -323,10 +323,11 @@ fn main() {
         cfg.local_ip, cfg.local_port, cfg.remote_ip, cfg.remote_tcp_port, cfg.remote_udp_port
     ));
     log::push(format!(
-        "Runtime: pool={} refill={} splice={} backlog={} udp_buf={} log={}",
+        "Runtime: pool={} refill={} splice_chunk={} pipe={} backlog={} udp_buf={} log={}",
         cfg.pool_size,
         cfg.refill_batch,
         cfg.splice_chunk,
+        cfg.splice_pipe_size,
         cfg.listen_backlog,
         cfg.udp_socket_buffer,
         if cfg.log_enable { "on" } else { "off" }
@@ -477,10 +478,10 @@ fn main() {
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
-                            tune_pipe(pipe_l2r_r.as_fd(), splice_chunk);
-                            tune_pipe(pipe_l2r_w.as_fd(), splice_chunk);
-                            tune_pipe(pipe_r2l_r.as_fd(), splice_chunk);
-                            tune_pipe(pipe_r2l_w.as_fd(), splice_chunk);
+                            tune_pipe(pipe_l2r_r.as_fd(), cfg.splice_pipe_size);
+                            tune_pipe(pipe_l2r_w.as_fd(), cfg.splice_pipe_size);
+                            tune_pipe(pipe_r2l_r.as_fd(), cfg.splice_pipe_size);
+                            tune_pipe(pipe_r2l_w.as_fd(), cfg.splice_pipe_size);
 
                             // Initial epoll registration flags (#2+#3: EPOLLET + EPOLLRDHUP).
                             // During connect: fd_l gets no EPOLLIN (wait for remote to connect).
@@ -1046,9 +1047,7 @@ fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
 }
 
-fn tune_pipe(fd: BorrowedFd<'_>, splice_chunk: usize) {
-    // Clamp to the same range validated by Config::validate() so that the pipe
-    // capacity always matches splice_chunk exactly.
-    let size = splice_chunk.clamp(16 * 1024, 1024 * 1024) as i32;
+fn tune_pipe(fd: BorrowedFd<'_>, splice_pipe_size: usize) {
+    let size = splice_pipe_size as i32;
     let _ = nix::fcntl::fcntl(fd, FcntlArg::F_SETPIPE_SZ(size));
 }

@@ -40,7 +40,11 @@ half_close_timeout = 6
 preconnect_ttl_ms = 60000
 
 # Bytes — maximum data buffered in the splice pipe at any time.
-splice_chunk      = 65536
+splice_chunk      = 131072
+
+# Bytes — kernel pipe buffer capacity (F_SETPIPE_SZ).
+# Independent of splice_chunk.  Linux default pipe-max-size is 1 MiB.
+splice_pipe_size  = 1048576
 
 # ── UDP ───────────────────────────────────────────────────────────
 #

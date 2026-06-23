@@ -5,7 +5,7 @@
 //! * #4:    Safe nix wrappers for the entire UDP path (no more libc unsafe blocks).
 //! * #5:    OwnedFd in Conn — lifetimes are correct and fds close automatically.
 //! * #7:    SIGTERM/SIGINT handler with AtomicBool for graceful shutdown.
-
+//!
 mod config;
 mod log;
 mod pool;
@@ -46,20 +46,20 @@ extern "C" fn handle_shutdown(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
-// ── CLI ──────────────────────────────────────────────────────────────────────
+// ── CLI ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-    #[command(
-        name = "relay",
-        about = "TCP/UDP preconnection relay (Rust rewrite)",
-        version = concat!(
-            env!("CARGO_PKG_VERSION"),
-            " (", env!("GIT_COMMIT"), " ",
-            env!("BUILD_TIME"),
-            ")"
-        )
-    )]
-    struct Cli {
+#[command(
+    name = "relay",
+    about = "TCP/UDP preconnection relay (Rust rewrite)",
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (", env!("GIT_COMMIT"), " ",
+        env!("BUILD_TIME"),
+        ")"
+    )
+)]
+struct Cli {
     #[arg(short = 'c', long, env = "RELAY_CONFIG")]
     config: Option<String>,
     #[arg(short, long, env = "LOCAL_IP")]
@@ -95,7 +95,7 @@ fn decode_token(token: u64) -> (u16, usize, bool) {
     (gen, idx, is_remote)
 }
 
-// ── Zero-copy pump ───────────────────────────────────────────────────────────
+// ── Zero-copy pump ─────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
 enum PumpStatus {
@@ -204,66 +204,54 @@ struct Conn {
     connect_start: Instant,
 }
 
-/// Re-arm both fds with the correct EPOLLET + EPOLLRDHUP flags (#2 + #3).
+/// Re-arm both fds with level-triggered semantics.
 ///
-/// ET mode requires unconditional epoll_ctl(MOD) on every event: the kernel
-/// re-checks the fd state and will fire immediately if data is already
-/// buffered. Skipping MOD when flags are unchanged is safe in LT but fatal
-/// in ET — any data left in the socket buffer after a partial read would
-/// never produce another edge, stalling the connection.
+/// For long-lived relay connections, ET can miss the follow-up edge after a
+/// partial splice/pipe-drain. That shows up as a connection that stays alive
+/// but stops forwarding traffic until some later event happens.
 ///
-/// Flow control: EPOLLIN is suppressed when the pipe for that direction is
-/// already full (len >= splice_chunk).  Without this guard, a congested dst
-/// causes pump() to return immediately (pipe full, dst EAGAIN), conn_watch
-/// unconditionally re-arms EPOLLIN, the kernel sees data in the src buffer
-/// and fires instantly, and the cycle repeats — a busy-loop that burns 100 %
-/// of one CPU core until dst becomes writable again.  Suppressing EPOLLIN
-/// when we cannot consume more data breaks the cycle; EPOLLOUT on the dst fd
-/// will re-arm EPOLLIN once the pipe has been drained.
-fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize, splice_chunk: usize) {
+/// Level-triggered mode avoids that missed-edge problem: once a socket is
+/// readable/writable the kernel will keep delivering events until the app has
+/// drained it. We still use EPOLLOUT to avoid busy loops when the opposite
+/// pipe is congested, but we no longer rely on ET edge transitions.
+fn conn_watch(conn: &mut Conn, epoll: &Epoll, slab_idx: usize, splice_chunk: usize) -> bool {
     let token_l = encode_token(conn.gen, slab_idx, 0);
     let token_r = encode_token(conn.gen, slab_idx, 1);
 
     // fd_l: read client data (l2r), write to client (r2l drain).
-    let mut want_l = EpollFlags::EPOLLET;
+    let mut want_l = EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP | EpollFlags::EPOLLRDHUP;
     if !conn.eof_l2r {
-        want_l |= EpollFlags::EPOLLRDHUP;
-        // Suppress EPOLLIN when the l2r pipe is full — we can't splice more
-        // until the remote (fd_r) side drains it via EPOLLOUT.
-        if conn.len_l2r < splice_chunk {
-            want_l |= EpollFlags::EPOLLIN;
-        }
+        want_l |= EpollFlags::EPOLLIN;
     }
     if conn.len_r2l > 0 {
         want_l |= EpollFlags::EPOLLOUT;
     }
 
     // fd_r: read server data (r2l), write to server (l2r drain).
-    let mut want_r = EpollFlags::EPOLLET;
+    let mut want_r = EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP | EpollFlags::EPOLLRDHUP;
     if !conn.eof_r2l {
-        want_r |= EpollFlags::EPOLLRDHUP;
-        // Suppress EPOLLIN when the r2l pipe is full.
-        if conn.len_r2l < splice_chunk {
-            want_r |= EpollFlags::EPOLLIN;
-        }
+        want_r |= EpollFlags::EPOLLIN;
     }
     if conn.len_l2r > 0 {
         want_r |= EpollFlags::EPOLLOUT;
     }
 
-    // Always MOD — this is the ET re-arm. Cost: ~2 syscalls (~400 ns) per
-    // connection event, completely negligible compared to data throughput.
+    // Re-arm every time. In LT mode this is still cheap and prevents the
+    // "socket is readable but no more edge arrives" stall.
     let mut ev_l = EpollEvent::new(want_l, token_l);
     if let Err(e) = epoll.modify(&conn.fd_l, &mut ev_l) {
         log_fmt!("epoll.modify(fd_l) error: {e}");
+        return false;
     }
     let mut ev_r = EpollEvent::new(want_r, token_r);
     if let Err(e) = epoll.modify(&conn.fd_r, &mut ev_r) {
         log_fmt!("epoll.modify(fd_r) error: {e}");
+        return false;
     }
+    true
 }
 
-// ── UDP association ──────────────────────────────────────────────────────────
+// ── UDP association ────────────────────────────────────────────────────────
 
 struct UdpAssoc {
     cli_addr: SockaddrStorage,                  // address to echo replies to
@@ -272,7 +260,7 @@ struct UdpAssoc {
     last_act: Instant,
 }
 
-// ── Slab helpers ─────────────────────────────────────────────────────────────
+// ── Slab helpers ─────────────────────────────────────────────────────────
 
 fn alloc_slot<T>(slab: &mut Vec<Option<T>>, free: &mut VecDeque<usize>, val: T) -> usize {
     if let Some(idx) = free.pop_front() {
@@ -290,7 +278,7 @@ fn free_slot<T>(slab: &mut Vec<Option<T>>, free: &mut VecDeque<usize>, idx: usiz
     free.push_back(idx);
 }
 
-// ── main ─────────────────────────────────────────────────────────────────────
+// ── main ────────────────────────────────────────────────────────────
 
 fn main() {
     let cli = Cli::parse();
@@ -390,13 +378,19 @@ fn main() {
     epoll
         .add(
             tcp_listen.as_fd(),
-            EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, TOKEN_ACCEPT),
+            EpollEvent::new(
+                EpollFlags::EPOLLIN | EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP,
+                TOKEN_ACCEPT,
+            ),
         )
         .unwrap();
     epoll
         .add(
             udp_listen.as_fd(),
-            EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, TOKEN_UDP),
+            EpollEvent::new(
+                EpollFlags::EPOLLIN | EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP,
+                TOKEN_UDP,
+            ),
         )
         .unwrap();
 
@@ -427,7 +421,7 @@ fn main() {
     let mut events = vec![EpollEvent::new(EpollFlags::empty(), 0); 2048];
     let mut last_cleanup = Instant::now();
 
-    // ── Event loop ───────────────────────────────────────────────────────────
+    // ── Event loop ────────────────────────────────────────────────────────
     loop {
         let n = match epoll.wait(&mut events, EpollTimeout::from(100u16)) {
             Ok(n) => n,
@@ -497,23 +491,26 @@ fn main() {
                             // Initial epoll registration flags (#2+#3: EPOLLET + EPOLLRDHUP).
                             // During connect: fd_l gets no EPOLLIN (wait for remote to connect).
                             let init_flags_l = if connecting {
-                                EpollFlags::EPOLLET | EpollFlags::EPOLLRDHUP
+                                EpollFlags::EPOLLRDHUP | EpollFlags::EPOLLERR | EpollFlags::EPOLLHUP
                             } else {
-                                EpollFlags::EPOLLET | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP
+                                EpollFlags::EPOLLIN
+                                    | EpollFlags::EPOLLRDHUP
+                                    | EpollFlags::EPOLLERR
+                                    | EpollFlags::EPOLLHUP
                             };
                             let init_flags_r = if connecting {
-                                // LT mode for initial connect: EPOLLET is deliberately
-                                // omitted.  The TCP handshake can complete between the
-                                // non-blocking connect() and epoll_ctl(ADD); with ET the
-                                // edge is missed and EPOLLOUT never fires.  LT delivers
-                                // EPOLLOUT continuously until the handler sets
-                                // connecting=false and conn_watch() switches back to ET.
+                                // For the initial connect, keep EPOLLOUT so the handshake
+                                // completion is visible even if it finishes quickly after
+                                // connect() returns EINPROGRESS.
                                 EpollFlags::EPOLLOUT
                                     | EpollFlags::EPOLLRDHUP
                                     | EpollFlags::EPOLLERR
                                     | EpollFlags::EPOLLHUP
                             } else {
-                                EpollFlags::EPOLLET | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP
+                                EpollFlags::EPOLLIN
+                                    | EpollFlags::EPOLLRDHUP
+                                    | EpollFlags::EPOLLERR
+                                    | EpollFlags::EPOLLHUP
                             };
 
                             let gen = slab_gen;
@@ -577,7 +574,9 @@ fn main() {
                                     );
                                     if err == Ok(0) {
                                         conn.connecting = false;
-                                        conn_watch(conn, &epoll, slab_idx, splice_chunk);
+                                        if !conn_watch(conn, &epoll, slab_idx, splice_chunk) {
+                                            free_slot(&mut conns, &mut free_slots, slab_idx);
+                                        }
                                     } else {
                                         log::push("Connect failed (post-ADD)");
                                         free_slot(&mut conns, &mut free_slots, slab_idx);
@@ -772,7 +771,10 @@ fn main() {
                         continue;
                     }
                     conn.connecting = false;
-                    conn_watch(conn, &epoll, idx, splice_chunk);
+                    if !conn_watch(conn, &epoll, idx, splice_chunk) {
+                        free_slot(&mut conns, &mut free_slots, idx);
+                        continue;
+                    }
                 }
                 continue;
             }
@@ -917,11 +919,6 @@ fn main() {
             if conn.eof_r2l && conn.len_r2l == 0 && !conn.shut_wr_l {
                 s::shutdown_write(conn.fd_l.as_raw_fd());
                 conn.shut_wr_l = true;
-                // conn_watch below will NOT re-arm EPOLLOUT on fd_l because
-                // shut_wr_l is only set when eof_r2l && len_r2l == 0, so the
-                // guard `conn.len_r2l > 0` in conn_watch is also false.  If
-                // another code path ever sets shut_wr_l without draining len_r2l
-                // first, EPOLLOUT would re-arm on a shut-down fd and busy-loop.
             }
 
             if conn.eof_l2r && conn.eof_r2l && conn.len_l2r == 0 && conn.len_r2l == 0 {
@@ -930,7 +927,10 @@ fn main() {
                 continue;
             }
 
-            conn_watch(conn, &epoll, idx, splice_chunk);
+            if !conn_watch(conn, &epoll, idx, splice_chunk) {
+                free_slot(&mut conns, &mut free_slots, idx);
+                continue;
+            }
         }
 
         // ── Periodic cleanup (1 Hz) ──────────────────────────────────────────
@@ -1052,7 +1052,7 @@ fn direct_connect(addr: &SockAddr, cfg: &Config) -> Result<ConnectState, ()> {
     }
 }
 
-// ── Pipe helpers ─────────────────────────────────────────────────────────────
+// ── Pipe helpers ─────────────────────────────────────────────────────────
 
 fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     use nix::fcntl::OFlag;
